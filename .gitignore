@@ -5,3 +5,4 @@ __pycache__/
 .ipynb_checkpoints/
 docs/superpowers/specs/
 week1-explainer.md
+.claude
