@@ -42,6 +42,17 @@ def test_resolve_vendor_registry_overlap_none_when_no_registry_data():
     assert candidates[0].signals["registry_overlap"] is None
 
 
+def test_resolve_vendor_registry_overlap_true_for_npm_git_prefixed_url():
+    # npm registry returns repository URLs like "git+https://github.com/lodash/lodash.git";
+    # _domain must normalize these to match a plain CPE reference so overlap is detected.
+    products = [_cpe_product("lodash", "lodash", "Lodash", refs=["https://github.com/lodash/lodash"])]
+    registry_meta = {"urls": ["git+https://github.com/lodash/lodash.git"]}
+    with patch("it_security_agent.cpe_dictionary.search", return_value=products), \
+         patch("it_security_agent.registry.cached_fetch_metadata", return_value=registry_meta):
+        candidates = normalize.resolve_vendor("lodash", "npm")
+    assert candidates[0].signals["registry_overlap"] is True
+
+
 def test_resolve_vendor_does_not_combine_signals_into_a_score():
     products = [_cpe_product("djangoproject", "django", "Django")]
     with patch("it_security_agent.cpe_dictionary.search", return_value=products), \

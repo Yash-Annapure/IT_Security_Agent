@@ -16,7 +16,15 @@ class VendorCandidate:
 
 
 def _domain(url: str) -> str:
-    url = url.lower().replace("https://", "").replace("http://", "")
+    # npm repository URLs commonly use a "git+" prefix and a ".git" suffix, e.g.
+    # "git+https://github.com/lodash/lodash.git". Strip both so the domain matches
+    # a plain CPE reference like "https://github.com/lodash/lodash".
+    url = url.lower().strip()
+    if url.startswith("git+"):
+        url = url[len("git+"):]
+    url = url.replace("https://", "").replace("http://", "")
+    if url.endswith(".git"):
+        url = url[: -len(".git")]
     return url.split("/")[0].replace("www.", "")
 
 
