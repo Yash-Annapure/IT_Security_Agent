@@ -8,6 +8,7 @@ dependencies = [
     "jupyter>=1.1.1",
     "matplotlib>=3.11.0",
     "nbformat>=5.10.4",
+    "packaging>=26.2",
     "pandas>=3.0.3",
     "python-dotenv>=1.2.2",
     "rapidfuzz>=3.14.5",
