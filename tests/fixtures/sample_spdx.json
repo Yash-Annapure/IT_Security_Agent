@@ -1,0 +1,17 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "packages": [
+    {
+      "name": "requests",
+      "versionInfo": "2.31.0",
+      "externalRefs": [
+        {"referenceType": "purl", "referenceLocator": "pkg:pypi/requests@2.31.0"}
+      ]
+    },
+    {
+      "name": "unresolvable-package",
+      "versionInfo": "1.0.0",
+      "externalRefs": []
+    }
+  ]
+}
