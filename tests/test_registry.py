@@ -24,6 +24,7 @@ def test_fetch_metadata_npm():
     get_fn = MagicMock(return_value=_response(200, body))
     result = registry.fetch_metadata("npm", "lodash", get_fn=get_fn)
     assert "https://lodash.com" in result["urls"]
+    assert "git+https://github.com/lodash/lodash.git" in result["urls"]
 
 
 def test_fetch_metadata_unknown_ecosystem_returns_none():
