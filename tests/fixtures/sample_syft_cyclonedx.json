@@ -1,0 +1,7 @@
+{
+  "bomFormat": "CycloneDX",
+  "components": [
+    {"type": "library", "name": "openssl", "version": "3.0.2", "purl": "pkg:deb/debian/openssl@3.0.2"},
+    {"type": "library", "name": "flask", "version": "2.0.1", "purl": "pkg:pypi/flask@2.0.1"}
+  ]
+}
