@@ -8,3 +8,5 @@ week1-explainer.md
 .claude
 nvd_cache.db
 *.joblib
+reports/
+.coverage
