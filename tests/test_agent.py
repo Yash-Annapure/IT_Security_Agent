@@ -1,6 +1,9 @@
 from unittest.mock import MagicMock, patch
 
-from it_security_agent import agent
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+
+from it_security_agent import agent, explain, labeling
 from it_security_agent.normalize import VendorCandidate
 from it_security_agent.schema import Component
 
@@ -75,3 +78,32 @@ def test_rejected_findings_are_kept_not_dropped():
     result = _run_scan(component, [], ["CVE-2024-0002"], osv_vulns=[], kev_entry=None, confidence=0.9)
     assert len(result.rejected) == 1
     assert result.rejected[0].cve == "CVE-2024-0002"
+
+
+def test_review_queue_uses_real_explainer_over_labeling_features():
+    # Regression guard: the review-queue branch must feed predict_confidence and
+    # explain_match a vector matching labeling.FEATURES exactly (no registry_overlap
+    # leaking in, ecosystem_pypi/osv_corroborated present). Drive it with a real
+    # fitted model + real SHAP explainer so a column mismatch would actually raise.
+    X = pd.DataFrame([{f: i % 2 for f in labeling.FEATURES} for i in range(20)])
+    y = pd.Series([i % 2 for i in range(20)])
+    rf = RandomForestClassifier(n_estimators=10, random_state=0).fit(X, y)
+    real_explainer = explain.make_explainer("random_forest", rf, X)
+
+    component = Component(name="lodash", version="4.17.15", ecosystem="npm", source="test")
+    # Candidate carries the normalize-side 6-key signals dict (includes registry_overlap).
+    candidate = VendorCandidate(vendor="lodash", product="lodash", signals={
+        "vendor_equals_package": 1, "name_similarity": 0.9, "registry_overlap": True,
+        "py_keyword_score": 0, "js_keyword_score": 1, "keyword_alignment": 1,
+    })
+
+    # osv_vulns=[] -> osv_disagrees, and threshold above any probability -> review queue.
+    with patch("it_security_agent.matching.find_candidates", return_value=([_match(vendor_candidate=candidate)], [])), \
+         patch("it_security_agent.osv.query", return_value=[]), \
+         patch("it_security_agent.kev.is_kev", return_value=None):
+        result = agent.scan([component], "random_forest", rf, 2.0, real_explainer)
+
+    assert len(result.review_queue) == 1
+    finding = result.review_queue[0]
+    assert finding.explanation is not None
+    assert set(finding.explanation.keys()) == set(labeling.FEATURES)
