@@ -6,3 +6,5 @@ __pycache__/
 docs/superpowers/specs/
 week1-explainer.md
 .claude
+nvd_cache.db
+*.joblib
