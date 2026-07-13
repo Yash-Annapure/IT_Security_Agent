@@ -9,7 +9,7 @@ def _finding_to_dict(f):
         "package": f.component.name, "version": f.component.version, "ecosystem": f.component.ecosystem,
         "cve": f.cve, "severity": f.severity, "cvss_score": f.cvss_score,
         "confidence": f.confidence, "corroboration": f.corroboration, "kev_hit": f.kev_hit,
-        "note": f.note, "explanation": f.explanation,
+        "model_confident": f.model_confident, "note": f.note, "explanation": f.explanation,
     }
 
 
@@ -17,7 +17,14 @@ OSV_ECOSYSTEMS = {"PyPI", "npm"}
 
 
 def osv_agreement_summary(result) -> dict:
-    eligible = [f for f in result.confirmed if f.component.ecosystem in OSV_ECOSYSTEMS]
+    # Only measure OSV agreement over findings the model was independently confident
+    # about. Low-confidence-but-OSV-agrees confirmations can't disagree by construction
+    # (OSV itself pushed them into `confirmed`), so including them would make this an
+    # inflated, partly circular "independent agreement" rate.
+    eligible = [
+        f for f in result.confirmed
+        if f.component.ecosystem in OSV_ECOSYSTEMS and f.model_confident
+    ]
     agreed = [f for f in eligible if f.corroboration == "osv_agrees"]
     rate = (len(agreed) / len(eligible)) if eligible else None
     return {"eligible": len(eligible), "agreed": len(agreed), "agreement_rate": rate}

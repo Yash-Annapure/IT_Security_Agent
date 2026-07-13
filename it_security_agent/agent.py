@@ -18,6 +18,7 @@ class Finding:
     explanation: dict | None = None
     kev_hit: bool = False
     note: str = ""
+    model_confident: bool = False
 
 
 @dataclass
@@ -76,10 +77,11 @@ def triage_component(component, winning_model_name, winning_model, threshold, ex
         # over confirmed findings, so a corroboration value that's only checked
         # sometimes would silently corrupt that statistic.
         corroboration = _corroboration(component, osv_vulns)
+        model_confident = confidence is not None and confidence >= threshold
         f = Finding(
             component=component, cve=finding_data["cve"], severity=finding_data["severity"],
             cvss_score=finding_data["cvss_score"], confidence=confidence, kev_hit=bool(kev_entry),
-            corroboration=corroboration,
+            corroboration=corroboration, model_confident=model_confident,
         )
 
         if confidence >= threshold or corroboration == "osv_agrees":

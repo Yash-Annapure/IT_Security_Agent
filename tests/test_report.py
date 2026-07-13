@@ -23,14 +23,28 @@ def test_to_dict_has_all_four_buckets_plus_osv_summary():
 def test_osv_agreement_summary_counts_pypi_npm_confirmed_only():
     pypi_component = Component(name="django", version="2.2.0", ecosystem="PyPI", source="test")
     debian_component = Component(name="openssl", version="3.0.2", ecosystem="Debian", source="test")
-    agreeing = Finding(component=pypi_component, cve="CVE-2024-0001", severity="HIGH", cvss_score=7.5, corroboration="osv_agrees")
-    not_checked = Finding(component=debian_component, cve="CVE-2024-0002", severity="HIGH", cvss_score=7.5, corroboration="not_checked")
-    disagreeing = Finding(component=pypi_component, cve="CVE-2024-0003", severity="HIGH", cvss_score=7.5, corroboration="osv_disagrees")
+    # model_confident=True marks these as independently confident (not OSV-pushed) findings.
+    agreeing = Finding(component=pypi_component, cve="CVE-2024-0001", severity="HIGH", cvss_score=7.5, corroboration="osv_agrees", model_confident=True)
+    not_checked = Finding(component=debian_component, cve="CVE-2024-0002", severity="HIGH", cvss_score=7.5, corroboration="not_checked", model_confident=True)
+    disagreeing = Finding(component=pypi_component, cve="CVE-2024-0003", severity="HIGH", cvss_score=7.5, corroboration="osv_disagrees", model_confident=True)
     result = ScanResult(confirmed=[agreeing, not_checked, disagreeing])
     summary = report.osv_agreement_summary(result)
     assert summary["eligible"] == 2  # only the two PyPI findings count; Debian is excluded
     assert summary["agreed"] == 1
     assert summary["agreement_rate"] == 0.5
+
+
+def test_osv_agreement_summary_excludes_osv_pushed_confirmations():
+    # A low-confidence finding confirmed only because OSV agreed must NOT count toward
+    # the independent agreement rate - it can't disagree by construction.
+    pypi = Component(name="django", version="2.2.0", ecosystem="PyPI", source="test")
+    confident_agree = Finding(component=pypi, cve="CVE-2024-0001", severity="HIGH", cvss_score=7.5, corroboration="osv_agrees", model_confident=True)
+    osv_pushed = Finding(component=pypi, cve="CVE-2024-0002", severity="HIGH", cvss_score=7.5, corroboration="osv_agrees", model_confident=False)
+    result = ScanResult(confirmed=[confident_agree, osv_pushed])
+    summary = report.osv_agreement_summary(result)
+    assert summary["eligible"] == 1  # only the model-confident finding is eligible
+    assert summary["agreed"] == 1
+    assert summary["agreement_rate"] == 1.0
 
 
 def test_to_json_writes_file(tmp_path):
