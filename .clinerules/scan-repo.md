@@ -14,19 +14,24 @@ that kind of question from memory or training data - always call the tool.
 ## How to call it (do these two steps in order)
 
 1. Read the repo's actual lockfile yourself first, with your normal file tool.
-   Look for one of these, in this order of preference: `uv.lock` (or any other
-   `*.lock`), `package-lock.json`, `requirements.txt`.
-2. Call `scan_repo` with that file's full text as `lockfile_content`. Do not
-   summarize, truncate, or retype the file yourself - pass the raw text you
-   read.
+   Look for one of these **at the root of the project you were asked to scan**
+   (not your currently open editor tab, not a file mentioned earlier in this
+   conversation for some other reason) - in this order of preference: `uv.lock`
+   (or any other `*.lock`), `package-lock.json`, `requirements.txt`.
+2. Call `scan_repo` with `lockfile_content` set to the literal file contents
+   you just read in step 1 - the real text, substituted in, not a description
+   of it and not a placeholder string. If you have not actually read a real
+   lockfile yet, do not call this tool - go do step 1 first.
 
-Example call shape (values are illustrative):
-```
-scan_repo(lockfile_content="<the full text of uv.lock you just read>")
-```
+Before calling the tool, sanity-check your own `lockfile_content` value: does
+it contain actual package names and version numbers from a real dependency
+file? If it looks like a description, a filename, angle brackets, or anything
+other than literal file content, you have not done step 1 yet - stop and read
+the file for real first.
 
-If you can't find a lockfile, say so and ask the user where their dependency
-file lives - do not guess or invent one.
+If you can't find a lockfile at the project root, say so and ask the user
+where their dependency file lives - do not guess or invent one, and do not
+substitute some other unrelated file just because it's open or nearby.
 
 ## There is no "pass in an existing SBOM" option - this is intentional
 
