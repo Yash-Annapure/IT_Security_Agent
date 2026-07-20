@@ -12,7 +12,7 @@ Week 2 gave us a matching engine and a first classifier, but it only read one ha
 
 *Cue: used to only read one file format, now reads anything.*
 
-First, what goes in. We used to only read `uv.lock`. Now there are three paths in: parse an existing SBOM, scan a container image with Syft, or read the repo's own lockfile directly, `uv.lock`, `package-lock.json`, or `requirements.txt`. And if a repo has none of those, Section 10, later on, generates a real CycloneDX SBOM ourselves, straight from the lockfile, no external tool needed.
+First, what goes in. We used to only read `uv.lock`. Now there are three paths in: parse an existing SBOM, scan a container image with Syft, or read the repo's own lockfile directly, `uv.lock`, `package-lock.json`, or `requirements.txt`. And if a repo has none of those at all, Section 10 covers what happens then.
 
 ## Notebook Sections 2 and 3 — "Sync NVD + CISA KEV once" / "Train two models, keep the better one"
 
@@ -44,10 +44,25 @@ Sections 7 and 8 go a level deeper on the model. Section 3 picked the random for
 
 This is the section I actually want to highlight. Week 2 had four packages whose names collide with unrelated projects, `babel`, `jupyter`, `json5`, `jsonpointer`. We went back and tested, live, against real NVD data, whether we'd actually fixed that. Three of the four now get caught correctly, and running this check found two real bugs, which we fixed: a domain check that couldn't tell two different GitHub repos apart, and a threshold picker that was too permissive. The fourth, `jupyter`, still gets wrongly confirmed. Not a bug, just the honest limit of the current features, and that's written down as next steps, not hidden.
 
+## Notebook Section 10 — "Generating an SBOM from repo files, then scanning it"
+
+*Cue: last input-path gap. If there's no SBOM at all, we make one instead of giving up.*
+
+Section 10 closes that gap. Up to now we'd either parsed a lockfile straight into components, or scanned an SBOM someone else already produced. This is the third case: no SBOM at all. `generate_sbom.py` builds a real CycloneDX document straight from this project's own `uv.lock`, no external tool. We then feed that generated SBOM back through the exact same parser a third-party SBOM would use, to confirm nothing was lost or invented in the round trip, and scan a subset of it with the model already trained in Section 3. This isn't a demo-only trick either, it's exactly what the MCP server's `scan_repo` tool does for Cline: generate a real SBOM from whatever lockfile it's handed, then scan it.
+
 ## Closing (10-15 seconds) — outside the notebook, live Cline demo
 
 And this whole pipeline is now wired up so Cline, an AI coding assistant, can call it directly, talking to a model we're hosting ourselves. No dashboard to build. You just ask it to check your repo, and it reads your lockfile, runs the scan, and hands back a triaged answer.
 
 ---
 
-**Rough timing:** opening 10s, Section 1 about 25-30s, Sections 2/3 combined about 40-45s, Section 4 about 20s, Sections 5/6 combined about 25-30s, Sections 7/8 combined about 50-55s, Section 9 about 35-40s, closing 10-15s. That's roughly 3:35 to 3:55 now, over the original 3-minute target. If you need to cut back down: Sections 7/8 are the first to go entirely, they're a deeper elaboration of what Sections 3 and 4 already cover, not new ground. After that, trim Section 1's SBOM-generation aside. Don't cut Section 9 short, it's the strongest part of the talk.
+**Rough timing:** opening 10s, Section 1 about 20-25s, Sections 2/3 combined about 40-45s, Section 4 about 20s, Sections 5/6 combined about 25-30s, Sections 7/8 combined about 50-55s, Section 9 about 35-40s, Section 10 about 50-55s, closing 10-15s. That's now roughly 4:20 to 4:40 with every notebook section covered, well past the original 3-minute target.
+
+This is now a full walkthrough script, not a 3-minute one. If you're actually presenting in 3 minutes, here's the priority order for cutting, highest-value first (keep these), lowest-value last (cut these first):
+
+1. Keep: Opening, Section 9 (the weakness audit), closing (the Cline demo). These are the three moments that make the talk memorable, not just correct.
+2. Keep if time allows: Section 1, Sections 2/3, Sections 5/6. This is the actual pipeline story.
+3. Cut first: Sections 7/8. They elaborate on Sections 3/4 rather than covering new ground.
+4. Cut second: Section 10. Real and worth having in the full script, but the least essential to the story if you're forced to choose.
+
+Cutting 3 and 4 gets you back to roughly the original 3:00-3:15 version.
