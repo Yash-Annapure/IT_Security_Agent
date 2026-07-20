@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import time
 import uuid
@@ -104,6 +105,19 @@ print("Model loaded.", flush=True)
 app = FastAPI()
 
 
+@app.middleware("http")
+async def normalize_path(request: Request, call_next):
+    # Some OpenAI-compatible clients build the request path by string-joining a
+    # Base URL that already ends in "/" with a leading-"/" path segment, producing
+    # "//models" etc. Collapse repeated slashes before routing so a trailing slash
+    # left in a client's Base URL field doesn't hard-404.
+    path = request.scope["path"]
+    collapsed = re.sub(r"/{2,}", "/", path)
+    if collapsed != path:
+        request.scope["path"] = collapsed
+    return await call_next(request)
+
+
 def parse_tool_calls(text: str) -> tuple[str, list[dict] | None]:
     """Split Mistral's `[TOOL_CALLS][...]` output into (leading text, OpenAI-style tool_calls)."""
     if TOOL_CALL_TOKEN not in text:
@@ -151,12 +165,24 @@ def run_generate(messages: list[dict], tools: list[dict] | None, max_new_tokens:
     return tokenizer.decode(new_tokens, skip_special_tokens=True)
 
 
+@app.get("/")
+@app.get("/health")
+def health():
+    return {"status": "ok", "model": MODEL_ID}
+
+
+# Registered at both "/v1/..." (the OpenAI-standard path, what the README/Cline
+# setup expects) and bare "/..." (some OpenAI-compatible clients strip or never
+# add the "/v1" prefix depending on how their Base URL field is filled in) - so
+# this doesn't hard-fail on a client-side path quirk either way.
 @app.get("/v1/models")
+@app.get("/models")
 def list_models():
     return {"object": "list", "data": [{"id": MODEL_ID, "object": "model", "owned_by": "local"}]}
 
 
 @app.post("/v1/chat/completions")
+@app.post("/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
     messages = body["messages"]
