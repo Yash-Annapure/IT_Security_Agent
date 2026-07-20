@@ -256,6 +256,22 @@ def _flatten_content(content):
     return "".join(parts)
 
 
+# Small instruct models default to "just ask the human" even when told not to and
+# even when the answer is already sitting in the conversation - that's the loop this
+# repo kept hitting (Cline asking the same lockfile question after being answered).
+# This is appended to whatever system prompt Cline sends (which already carries
+# .clinerules) as a last, blunt reinforcement targeted at that exact failure mode.
+AGENT_REINFORCEMENT = (
+    "\n\nCRITICAL AUTONOMY RULE: Before asking the user anything, check two things "
+    "first: (1) can you get this yourself with one of your own tools (e.g. read a file "
+    "directly instead of asking where it is or what it contains), and (2) did the user "
+    "already answer this earlier in this conversation. If either is true, act on it "
+    "immediately - call the tool - instead of asking. Never ask the same question twice "
+    "in one conversation; if you already asked something and the user replied, use that "
+    "reply now, do not ask again."
+)
+
+
 def _normalize_messages(messages: list[dict]) -> list[dict]:
     normalized = []
     for m in messages:
@@ -263,6 +279,8 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
         if "content" in m:
             m["content"] = _flatten_content(m["content"])
         normalized.append(m)
+    if normalized and normalized[0].get("role") == "system" and isinstance(normalized[0].get("content"), str):
+        normalized[0]["content"] += AGENT_REINFORCEMENT
     return normalized
 
 
@@ -295,9 +313,17 @@ def run_generate(messages: list[dict], tools: list[dict] | None, max_new_tokens:
         print(rendered, flush=True)
         print("----- END RENDERED PROMPT -----", flush=True)
 
+    # Agent tool-use wants the single most-likely continuation, not variety - sampling
+    # at any real temperature is what lets a small model wander into "safe" fallbacks
+    # like re-asking a question it already has the answer to instead of committing to
+    # a tool call. Cline's own requested temperature is ignored here on purpose; cap it
+    # instead of respecting it if you ever want some sampling back. MAX_TEMPERATURE=1
+    # env var restores respecting the client's value, for comparison/debugging.
+    max_temperature = float(os.environ.get("MAX_TEMPERATURE", "0"))
+    effective_temperature = min(temperature or 0, max_temperature)
     gen_kwargs: dict = dict(**inputs, max_new_tokens=max_new_tokens, pad_token_id=tokenizer.eos_token_id)
-    if temperature and temperature > 0:
-        gen_kwargs.update(do_sample=True, temperature=temperature, top_p=top_p)
+    if effective_temperature > 0:
+        gen_kwargs.update(do_sample=True, temperature=effective_temperature, top_p=top_p)
     else:
         gen_kwargs.update(do_sample=False)
 
