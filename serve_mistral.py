@@ -169,15 +169,34 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
     return normalized
 
 
+DEBUG_PROMPT = os.environ.get("DEBUG_PROMPT", "0") == "1"
+
+
 def run_generate(messages: list[dict], tools: list[dict] | None, max_new_tokens: int, temperature: float, top_p: float) -> str:
+    normalized = _normalize_messages(messages)
+
+    # Always-on, cheap sanity log: proves whether Cline's system message (which
+    # carries .clinerules + its own tool-use instructions + MCP tool schemas)
+    # actually arrived, and roughly how big it is. If "system" never shows up
+    # here, the model genuinely never saw any of that - it's not ignoring
+    # instructions, it never received them.
+    roles_summary = ", ".join(f"{m.get('role')}={len(str(m.get('content') or ''))}chars" for m in normalized)
+    print(f"[chat] {len(normalized)} messages: {roles_summary}  tools={len(tools) if tools else 0}", flush=True)
+
     inputs = tokenizer.apply_chat_template(
-        _normalize_messages(messages),
+        normalized,
         tools=tools or None,
         add_generation_prompt=True,
         tokenize=True,
         return_tensors="pt",
         return_dict=True,
     ).to(model.device)
+
+    if DEBUG_PROMPT:
+        rendered = tokenizer.decode(inputs["input_ids"][0])
+        print(f"----- RENDERED PROMPT ({len(rendered)} chars) -----", flush=True)
+        print(rendered, flush=True)
+        print("----- END RENDERED PROMPT -----", flush=True)
 
     gen_kwargs: dict = dict(**inputs, max_new_tokens=max_new_tokens, pad_token_id=tokenizer.eos_token_id)
     if temperature and temperature > 0:
