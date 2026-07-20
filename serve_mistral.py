@@ -86,12 +86,109 @@ def startup_banner() -> str:
     return "\n".join(lines)
 
 
+# vLLM's own tool-calling chat template for Mistral (examples/tool_chat_template_mistral.jinja
+# in the vLLM repo) - the same fix the README already points to for vLLM itself ("some
+# Mistral-7B-Instruct revisions need the explicit chat-template"). Forced on by default here
+# rather than trusting the model repo's bundled tokenizer_config.json template, which has a
+# history of being inconsistent about system-message + tool-schema rendering for this model.
+# Set USE_VLLM_TOOL_TEMPLATE=0 to fall back to the model repo's own template instead.
+MISTRAL_TOOL_CHAT_TEMPLATE = r"""{%- if messages[0]["role"] == "system" %}
+    {%- set system_message = messages[0]["content"] %}
+    {%- set loop_messages = messages[1:] %}
+{%- else %}
+    {%- set loop_messages = messages %}
+{%- endif %}
+{%- if not tools is defined %}
+    {%- set tools = none %}
+{%- endif %}
+{%- set user_messages = loop_messages | selectattr("role", "equalto", "user") | list %}
+
+{%- for message in loop_messages | rejectattr("role", "equalto", "tool") | rejectattr("role", "equalto", "tool_results") | selectattr("tool_calls", "undefined") %}
+    {%- if (message["role"] == "user") != (loop.index0 % 2 == 0) %}
+        {{- raise_exception("After the optional system message, conversation roles must alternate user/assistant/user/assistant/...") }}
+    {%- endif %}
+{%- endfor %}
+
+{{- bos_token }}
+{%- for message in loop_messages %}
+    {%- if message["role"] == "user" %}
+        {%- if tools is not none and (message == user_messages[-1]) %}
+            {{- "[AVAILABLE_TOOLS] [" }}
+            {%- for tool in tools %}
+                {%- set tool = tool.function %}
+                {{- '{"type": "function", "function": {' }}
+                {%- for key, val in tool.items() if key != "return" %}
+                    {%- if val is string %}
+                        {{- '"' + key + '": "' + val + '"' }}
+                    {%- else %}
+                        {{- '"' + key + '": ' + val|tojson }}
+                    {%- endif %}
+                    {%- if not loop.last %}
+                        {{- ", " }}
+                    {%- endif %}
+                {%- endfor %}
+                {{- "}}" }}
+                {%- if not loop.last %}
+                    {{- ", " }}
+                {%- else %}
+                    {{- "]" }}
+                {%- endif %}
+            {%- endfor %}
+            {{- "[/AVAILABLE_TOOLS]" }}
+        {%- endif %}
+        {%- if loop.last and system_message is defined %}
+            {{- "[INST] " + system_message + "\n\n" + message["content"] + "[/INST]" }}
+        {%- else %}
+            {{- "[INST] " + message["content"] + "[/INST]" }}
+        {%- endif %}
+    {%- elif message["role"] == "tool_calls" or message.tool_calls is defined %}
+        {%- if message.tool_calls is defined %}
+            {%- set tool_calls = message.tool_calls %}
+        {%- else %}
+            {%- set tool_calls = message.content %}
+        {%- endif %}
+        {{- "[TOOL_CALLS] [" }}
+        {%- for tool_call in tool_calls %}
+            {%- set out = tool_call.function|tojson %}
+            {{- out[:-1] }}
+            {%- if not tool_call.id is defined or tool_call.id|length < 9 %}
+                {{- raise_exception("Tool call IDs should be alphanumeric strings with length >= 9! (1)" + tool_call.id) }}
+            {%- endif %}
+            {{- ', "id": "' + tool_call.id[-9:] + '"}' }}
+            {%- if not loop.last %}
+                {{- ", " }}
+            {%- else %}
+                {{- "]" + eos_token }}
+            {%- endif %}
+        {%- endfor %}
+    {%- elif message["role"] == "assistant" %}
+        {{- " " + message["content"] + eos_token }}
+    {%- elif message["role"] == "tool_results" or message["role"] == "tool" %}
+        {%- if message.content is defined and message.content.content is defined %}
+            {%- set content = message.content.content %}
+        {%- else %}
+            {%- set content = message.content %}
+        {%- endif %}
+        {{- '[TOOL_RESULTS] {"content": ' + content|string + ", " }}
+        {%- if not message.tool_call_id is defined or message.tool_call_id|length < 9 %}
+            {{- raise_exception("Tool call IDs should be alphanumeric strings with length >= 9! (2)" + message.tool_call_id) }}
+        {%- endif %}
+        {{- '"call_id": "' + message.tool_call_id[-9:] + '"}[/TOOL_RESULTS]' }}
+    {%- else %}
+        {{- raise_exception("Only user and assistant roles are supported, with the exception of an initial optional system message!") }}
+    {%- endif %}
+{%- endfor %}
+"""
+
 print(f"Loading {MODEL_ID} ...", flush=True)
 dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 if not torch.cuda.is_available():
     print("WARNING: no CUDA GPU detected - running a 7B model on CPU will be very slow.", flush=True)
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+if os.environ.get("USE_VLLM_TOOL_TEMPLATE", "1") == "1":
+    tokenizer.chat_template = MISTRAL_TOOL_CHAT_TEMPLATE
+    print("Using vLLM's tool-calling chat template (override).", flush=True)
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     torch_dtype=dtype,
