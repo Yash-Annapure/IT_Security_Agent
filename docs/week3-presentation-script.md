@@ -32,6 +32,12 @@ A confidence score by itself isn't something a person can act on. So any finding
 
 This used to just produce a score and stop. Now there's an actual policy. Anything on CISA's actively-exploited list gets escalated first. Confirmed findings and anything sent for human review are split automatically. And everything, including what got rejected, goes into a report, so nothing is silently dropped.
 
+## Notebook Sections 7 and 8 — "Model analysis: logistic regression vs. random forest" / "XAI deep dive: worked examples"
+
+*Cue: Section 3 picked a winner by one number, now we show our work on why, down to specific examples.*
+
+Sections 7 and 8 go a level deeper on the model. Section 3 picked the random forest by risk score alone, one number. Section 7 shows why: the confusion matrix for both models on the same held-out data, and which features each one actually leans on. The important part is `registry_overlap`, the one signal that actually separates a real match from a collision, is deliberately kept out of both models' features, it's the label, not an input, so neither model can just look it up. Section 8 then walks two real findings through the exact same explanation function `agent.py` uses for every review-queue case, so what's on screen is literally what a human reviewer would see, not a summary of it.
+
 ## Notebook Section 9 — "Weakness check: did we actually fix Week 2's name collisions?"
 
 *Cue: the part worth slowing down for. We didn't just claim this was fixed, we tested it live and found real bugs.*
@@ -44,4 +50,4 @@ And this whole pipeline is now wired up so Cline, an AI coding assistant, can ca
 
 ---
 
-**Rough timing:** opening 10s, Section 1 about 25-30s, Sections 2/3 combined about 40-45s, Section 4 about 20s, Sections 5/6 combined about 25-30s, Section 9 about 35-40s, closing 10-15s. That lands around 2:55 to 3:15. If you're running long, trim Sections 2/3's last sentence (the risk-weighting detail) or Section 1's SBOM-generation aside, those are the least load-bearing lines. Don't cut Section 9 short, it's the strongest part of the talk.
+**Rough timing:** opening 10s, Section 1 about 25-30s, Sections 2/3 combined about 40-45s, Section 4 about 20s, Sections 5/6 combined about 25-30s, Sections 7/8 combined about 50-55s, Section 9 about 35-40s, closing 10-15s. That's roughly 3:35 to 3:55 now, over the original 3-minute target. If you need to cut back down: Sections 7/8 are the first to go entirely, they're a deeper elaboration of what Sections 3 and 4 already cover, not new ground. After that, trim Section 1's SBOM-generation aside. Don't cut Section 9 short, it's the strongest part of the talk.
