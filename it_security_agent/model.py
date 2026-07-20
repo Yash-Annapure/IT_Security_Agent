@@ -21,12 +21,19 @@ def _risk_score(y_true, y_pred):
 
 def _best_threshold(model, X_test, y_test):
     probs = model.predict_proba(X_test)[:, 1]
-    best_threshold, best_risk = 0.5, None
-    for threshold in np.linspace(0.05, 0.95, 19):
-        y_pred = (probs >= threshold).astype(int)
-        risk = _risk_score(y_test, y_pred)
-        if best_risk is None or risk < best_risk:
-            best_risk, best_threshold = risk, float(threshold)
+    grid = np.linspace(0.05, 0.95, 19)
+    risks = [_risk_score(y_test, (probs >= t).astype(int)) for t in grid]
+    best_risk = min(risks)
+    # Multiple thresholds routinely tie for minimal risk (e.g. any gap between the two
+    # classes' predicted probabilities produces a whole plateau of equally-good cutoffs -
+    # this is the normal case, not an edge case, for a class-imbalance-aware classifier).
+    # Picking the *first* tied threshold - the lowest one tried - throws away all of that
+    # margin and lands on the most aggressive, least conservative end of the plateau: on
+    # real data this meant borderline/collision-shaped matches with only weak evidence
+    # still cleared the bar and were auto-confirmed instead of going to review_queue.
+    # The middle of the tied plateau keeps the same risk score but the most margin.
+    tied = [float(t) for t, r in zip(grid, risks) if r == best_risk]
+    best_threshold = float(np.median(tied))
     return best_threshold, best_risk
 
 

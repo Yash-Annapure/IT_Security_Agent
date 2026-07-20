@@ -15,6 +15,12 @@ class VendorCandidate:
     signals: dict = field(default_factory=dict)
 
 
+# Hosts where one domain hosts millions of unrelated projects. On these, "same
+# domain" proves nothing - github.com/python-babel/babel and github.com/babel/babel
+# are two different projects that would otherwise look identical to _domain().
+MULTI_TENANT_HOSTS = {"github.com", "gitlab.com", "bitbucket.org"}
+
+
 def _domain(url: str) -> str:
     # npm repository URLs commonly use a "git+" prefix and a ".git" suffix, e.g.
     # "git+https://github.com/lodash/lodash.git". Strip both so the domain matches
@@ -25,7 +31,16 @@ def _domain(url: str) -> str:
     url = url.replace("https://", "").replace("http://", "")
     if url.endswith(".git"):
         url = url[: -len(".git")]
-    return url.split("/")[0].replace("www.", "")
+    parts = url.split("/")
+    host = parts[0].replace("www.", "")
+    if host in MULTI_TENANT_HOSTS and len(parts) >= 3:
+        # Keep the owner/repo segments too, e.g. "github.com/janl/node-jsonpointer" -
+        # otherwise every GitHub-hosted project in NVD's CPE dictionary would look
+        # like a registry match for every GitHub-hosted PyPI/npm package (see Week 2/3
+        # "name collision" false positives: babel, json5, jsonpointer all reproduced
+        # this exact bug because both sides just happened to live on github.com).
+        return "/".join([host, parts[1], parts[2]])
+    return host
 
 
 def _registry_overlap(ecosystem, name, product_refs, conn):
