@@ -3,16 +3,24 @@
 Runs over Streamable HTTP so it can be hosted remotely (e.g. alongside a
 self-hosted Mistral-7B-Instruct) and registered as a remote MCP server in
 Cline. Because the server is remote, it has no access to the caller's local
-filesystem - `scan_repo` takes lockfile/SBOM *content*, not a path. The
-calling agent (Cline) is expected to read the file locally first and pass
-its text through.
+filesystem - `scan_repo` takes lockfile *content*, not a path. The calling
+agent (Cline) is expected to read the file locally first and pass its text
+through.
 
-Run with: `uv run it-security-agent-mcp` (see README.md for the full
-Cline + self-hosted-Mistral setup).
+Tamper-proof by design: this tool never accepts a pre-made SBOM as input,
+only a lockfile. A caller-supplied SBOM would be an unverified claim about
+what's actually pinned - it could omit or misstate a vulnerable package with
+no way for us to tell. Every scan generates its own CycloneDX SBOM straight
+from the lockfile instead, every time (see scan_repo's docstring).
+
+Plug-and-play: `uv run serve.py` (from the repo root) is all that's needed -
+it prints the URL and the exact Cline config to paste, then starts listening.
+See README.md for the one-time Mistral (vLLM) setup on the same box.
 """
 import datetime
 import json
 import os
+import socket
 import time
 from pathlib import Path
 
@@ -30,7 +38,10 @@ SYNC_INTERVAL_SECONDS = 6 * 3600  # re-sync NVD/KEV at most once per 6h server u
 PREWARM_BUDGET_SECONDS = 90  # same "skip on failure, give up after a budget" policy as the notebook
 MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
 
-MCP_HOST = os.environ.get("MCP_HOST", "127.0.0.1")
+# 0.0.0.0 by default: this is meant to be run on a remote box (a "datalab server")
+# and reached from wherever Cline is. There's no built-in auth - it's meant for a
+# private/trusted network, not the open internet.
+MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8765"))
 
 mcp = FastMCP("it-security-agent", host=MCP_HOST, port=MCP_PORT)
@@ -81,23 +92,6 @@ def parse_lockfile_components(lockfile_content, lockfile_type=None):
     raise ValueError(
         f"unsupported lockfile_type: {kind!r} (expected 'uv.lock', 'package-lock.json', or 'requirements.txt')"
     )
-
-
-def parse_components(lockfile_content=None, lockfile_type=None, sbom_content=None, sbom_format=None):
-    components = []
-    if lockfile_content:
-        components += parse_lockfile_components(lockfile_content, lockfile_type)
-    if sbom_content:
-        data = json.loads(sbom_content)
-        kind = sbom_format or ("cyclonedx" if "bomFormat" in data else "spdx")
-        if kind == "cyclonedx":
-            components += sbom.parse_cyclonedx(data)
-        elif kind == "spdx":
-            parsed, _ = sbom.parse_spdx(data)
-            components += parsed
-        else:
-            raise ValueError(f"unsupported sbom_format: {kind!r} (expected 'cyclonedx' or 'spdx')")
-    return components
 
 
 def prewarm(components, conn, budget_seconds=PREWARM_BUDGET_SECONDS):
@@ -201,62 +195,59 @@ def format_raw_matches(found: list, meta: dict) -> str:
 def format_sbom_section(bom: dict) -> str:
     return (
         f"\n\n## Generated SBOM (CycloneDX {bom['specVersion']}, {len(bom['components'])} components)\n"
-        "_Built directly from the lockfile you passed in - no external tool. If the user wants "
-        "this saved as a file, write it yourself (e.g. `sbom.cdx.json`); this server has no "
-        "access to their local filesystem._\n```json\n" + json.dumps(bom, indent=2) + "\n```"
+        "_Built directly from the lockfile you passed in - no external tool, and not something "
+        "you supplied. If the user wants this saved as a file, write it yourself (e.g. "
+        "`sbom.cdx.json`); this server has no access to their local filesystem._\n"
+        "```json\n" + json.dumps(bom, indent=2) + "\n```"
     )
 
 
 @mcp.tool()
 def scan_repo(
-    lockfile_content: str | None = None,
-    lockfile_type: str | None = None,
-    sbom_content: str | None = None,
-    sbom_format: str | None = None,
+    lockfile_content: str = "",
+    lockfile_type: str = "",
     max_components: int = 40,
     include_sbom: bool = True,
 ) -> str:
     """Scan a Python/npm dependency list for known vulnerabilities (NVD + CISA KEV + OSV.dev).
 
+    Tamper-proof by design: this tool never accepts a pre-made SBOM. An SBOM
+    handed to it would be an unverified claim about what's actually pinned -
+    it could omit a vulnerable package or misstate a version, and there'd be
+    no way to tell. The lockfile is the only real source of truth, so every
+    scan generates its own CycloneDX SBOM directly from it, every time.
+
     This server has no filesystem access to the caller's machine - read the
-    lockfile or SBOM file yourself first, then pass its raw text here.
+    lockfile yourself first, then pass its raw text here.
 
     Args:
         lockfile_content: Raw text of a `uv.lock`, `package-lock.json`, or
-            `requirements.txt` file. If given (and sbom_content isn't), a real
-            CycloneDX SBOM is generated from it and returned alongside the
-            findings - this is "create an SBOM from repo files," not just
-            scanning, when no SBOM already exists.
+            `requirements.txt` file. Required. A real CycloneDX SBOM is always
+            generated from it and returned alongside the findings.
         lockfile_type: "uv.lock", "package-lock.json", or "requirements.txt".
             Auto-detected if omitted.
-        sbom_content: Raw JSON text of an existing CycloneDX or SPDX SBOM file.
-            Use this instead of lockfile_content when the repo already has one -
-            nothing is (re)generated in that case.
-        sbom_format: "cyclonedx" or "spdx". Auto-detected if omitted.
         max_components: Cap on how many components to actually scan (keeps a single
-            call fast). Extra components are silently dropped, not erred on.
+            call fast). Extra components are silently dropped, not erred on - the
+            generated SBOM still covers all of them (see include_sbom).
         include_sbom: Whether to include the generated SBOM's full JSON in the
-            response (only applies when lockfile_content produced it). Default True.
+            response. Default True.
 
-    At least one of lockfile_content or sbom_content is required. Both may be
-    given together. The first call after server startup (or after 6h of
-    uptime) can take 1-2 minutes because it syncs NVD's CVE catalog first;
-    subsequent calls are fast.
+    The first call after server startup (or after 6h of uptime) can take 1-2
+    minutes because it syncs NVD's CVE catalog first; subsequent calls are fast.
     """
-    if not lockfile_content and not sbom_content:
+    if not lockfile_content:
         raise ValueError(
-            "No input provided. Read the repo's uv.lock/package-lock.json/requirements.txt "
-            "or SBOM file yourself first, then call this tool again with its contents as "
-            "lockfile_content or sbom_content."
+            "No lockfile content provided. Read the repo's uv.lock, package-lock.json, or "
+            "requirements.txt yourself first, then call this tool again with its contents as "
+            "lockfile_content. This tool does not accept a pre-made SBOM - it always builds "
+            "its own from the lockfile, by design."
         )
 
-    components = parse_components(lockfile_content, lockfile_type, sbom_content, sbom_format)
+    components = parse_lockfile_components(lockfile_content, lockfile_type)
     if not components:
-        return "No components could be parsed from the provided content."
+        return "No components could be parsed from the provided lockfile."
 
-    # Only generate an SBOM from a lockfile - if the caller already handed us an SBOM
-    # (sbom_content), there's nothing to generate, it already exists.
-    generated_bom = sbom.to_cyclonedx(components, bom_name="scan_repo") if lockfile_content else None
+    generated_bom = sbom.to_cyclonedx(components, bom_name="scan_repo")
 
     total = len(components)
     truncated = total > max_components
@@ -270,12 +261,73 @@ def scan_repo(
     result = run_pipeline(components, conn)
     text = format_raw_matches(raw_matches(components, conn), meta) if result is None else format_summary(result, meta)
 
-    if include_sbom and generated_bom is not None:
+    if include_sbom:
         text += format_sbom_section(generated_bom)
     return text
 
 
+def _detect_reachable_host() -> str | None:
+    """Best-effort guess at this machine's LAN-reachable IP.
+
+    Opens a UDP "connection" to a public address - nothing is actually sent,
+    this just asks the OS which local interface/IP it would route through,
+    which is normally the address other machines on the same network can
+    reach. Doesn't work behind NAT/inside some containers - MCP_PUBLIC_HOST
+    is the escape hatch for that.
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        return None
+
+
+def startup_banner(host: str, port: int) -> str:
+    public_host = os.environ.get("MCP_PUBLIC_HOST") or (_detect_reachable_host() if host == "0.0.0.0" else host)
+
+    lines = ["=" * 70, "it-security-agent MCP server", "=" * 70, f"Listening on {host}:{port}", ""]
+    if public_host is None:
+        lines += [
+            "Could not auto-detect this machine's reachable IP address.",
+            "Set MCP_PUBLIC_HOST to whatever address/hostname Cline should connect to "
+            "(e.g. this box's LAN IP or VPN hostname), then restart.",
+        ]
+    else:
+        url = f"http://{public_host}:{port}/mcp"
+        cline_config = json.dumps(
+            {"mcpServers": {"it-security-agent": {
+                "type": "streamableHttp", "url": url, "timeout": 300, "autoApprove": ["scan_repo"],
+            }}},
+            indent=2,
+        )
+        lines += [
+            f"URL for Cline: {url}",
+            "",
+            'Paste into Cline -> "Configure MCP Servers" (merge into an existing',
+            '"mcpServers" block if you already have one):',
+            "",
+            cline_config,
+            "",
+            "\"autoApprove\": [\"scan_repo\"] skips Cline's per-call confirmation prompt for",
+            "this tool - safe to leave in, since scan_repo never writes to or executes",
+            "anything on the caller's machine. Remove it from the list if you'd rather",
+            "approve each scan by hand.",
+            "",
+            "No built-in auth - only expose this on a private/trusted network.",
+        ]
+    if not NVD_API_KEY:
+        lines += ["", "NOTE: no NVD_API_KEY in .env - scans will run ~6x slower "
+                       "(6s vs 1s per NVD/CPE request). See README.md Setup."]
+    lines.append("=" * 70)
+    return "\n".join(lines)
+
+
 def main():
+    print(startup_banner(MCP_HOST, MCP_PORT), flush=True)
     mcp.run(transport="streamable-http")
 
 

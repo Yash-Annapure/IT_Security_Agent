@@ -9,15 +9,6 @@ from it_security_agent import mcp_server
 from it_security_agent.agent import Finding, ScanResult
 from it_security_agent.schema import Component
 
-SPDX_TEXT = json.dumps({
-    "spdxVersion": "SPDX-2.3",
-    "packages": [
-        {"name": "requests", "versionInfo": "2.31.0",
-         "externalRefs": [{"referenceType": "purl", "referenceLocator": "pkg:pypi/requests@2.31.0"}]},
-        {"name": "unresolvable-package", "versionInfo": "1.0.0", "externalRefs": []},
-    ],
-})
-
 UV_LOCK_TEXT = """
 [[package]]
 name = "django"
@@ -37,56 +28,28 @@ PACKAGE_LOCK_TEXT = json.dumps({
     }
 })
 
-CYCLONEDX_TEXT = json.dumps({
-    "bomFormat": "CycloneDX",
-    "components": [{"name": "axios", "version": "0.21.0", "purl": "pkg:npm/axios@0.21.0"}],
-})
-
-
-def test_parse_components_detects_uv_lock_by_content():
-    components = mcp_server.parse_components(lockfile_content=UV_LOCK_TEXT)
+def test_parse_lockfile_components_detects_uv_lock_by_content():
+    components = mcp_server.parse_lockfile_components(UV_LOCK_TEXT)
     assert [c.name for c in components] == ["django"]
     assert components[0].ecosystem == "PyPI"
 
 
-def test_parse_components_detects_requirements_txt_by_content():
+def test_parse_lockfile_components_detects_requirements_txt_by_content():
     # No "{" (not JSON) and no "[[package]]" (not uv.lock TOML) - falls back to
     # requirements.txt, the only remaining plain-text lockfile format supported.
-    components = mcp_server.parse_components(lockfile_content="django==2.2.0\nflask>=1.0\n")
+    components = mcp_server.parse_lockfile_components("django==2.2.0\nflask>=1.0\n")
     assert [c.name for c in components] == ["django"]
 
 
-def test_parse_components_detects_package_lock_by_content():
-    components = mcp_server.parse_components(lockfile_content=PACKAGE_LOCK_TEXT)
+def test_parse_lockfile_components_detects_package_lock_by_content():
+    components = mcp_server.parse_lockfile_components(PACKAGE_LOCK_TEXT)
     assert [c.name for c in components] == ["lodash"]
     assert components[0].ecosystem == "npm"
 
 
-def test_parse_components_detects_cyclonedx_sbom():
-    components = mcp_server.parse_components(sbom_content=CYCLONEDX_TEXT)
-    assert [c.name for c in components] == ["axios"]
-
-
-def test_parse_components_combines_lockfile_and_sbom():
-    components = mcp_server.parse_components(lockfile_content=UV_LOCK_TEXT, sbom_content=CYCLONEDX_TEXT)
-    assert {c.name for c in components} == {"django", "axios"}
-
-
-def test_parse_components_rejects_unknown_lockfile_type():
+def test_parse_lockfile_components_rejects_unknown_lockfile_type():
     with pytest.raises(ValueError):
-        mcp_server.parse_components(lockfile_content=UV_LOCK_TEXT, lockfile_type="Pipfile.lock")
-
-
-def test_parse_components_detects_spdx_sbom():
-    # SPDX has no "bomFormat" key - that's what parse_components uses to tell it apart
-    # from CycloneDX. Only the package with a purl should come through.
-    components = mcp_server.parse_components(sbom_content=SPDX_TEXT)
-    assert [c.name for c in components] == ["requests"]
-
-
-def test_parse_components_rejects_unknown_sbom_format():
-    with pytest.raises(ValueError):
-        mcp_server.parse_components(sbom_content=CYCLONEDX_TEXT, sbom_format="cdx-json")
+        mcp_server.parse_lockfile_components(UV_LOCK_TEXT, lockfile_type="Pipfile.lock")
 
 
 def test_bounded_get_sets_a_20s_timeout():
@@ -226,17 +189,6 @@ def test_scan_repo_can_omit_generated_sbom():
     assert "Generated SBOM" not in text
 
 
-def test_scan_repo_does_not_generate_sbom_from_existing_sbom_input():
-    # sbom_content is already an SBOM - nothing to generate.
-    with patch.object(mcp_server, "get_connection", return_value="conn"), \
-         patch.object(mcp_server, "_ensure_synced"), \
-         patch.object(mcp_server, "prewarm"), \
-         patch.object(mcp_server, "run_pipeline", return_value=None), \
-         patch.object(mcp_server, "raw_matches", return_value=[]):
-        text = mcp_server.scan_repo(sbom_content=CYCLONEDX_TEXT)
-    assert "Generated SBOM" not in text
-
-
 def test_scan_repo_generated_sbom_covers_full_list_not_just_scanned_subset():
     # The SBOM is a bill of materials - it should reflect everything found, even
     # if the vulnerability scan itself is capped by max_components for latency.
@@ -256,14 +208,85 @@ def test_scan_repo_generated_sbom_covers_full_list_not_just_scanned_subset():
 
 
 def test_main_runs_streamable_http_transport():
-    with patch.object(mcp_server.mcp, "run") as mock_run:
+    with patch.object(mcp_server.mcp, "run") as mock_run, \
+         patch.object(mcp_server, "startup_banner", return_value="banner"):
         mcp_server.main()
     mock_run.assert_called_once_with(transport="streamable-http")
 
 
-def test_scan_repo_requires_at_least_one_input():
-    with pytest.raises(ValueError):
+def test_detect_reachable_host_returns_an_ip_on_success():
+    with patch.object(mcp_server.socket, "socket") as mock_socket_cls:
+        mock_sock = mock_socket_cls.return_value
+        mock_sock.getsockname.return_value = ("192.168.1.42", 54321)
+        host = mcp_server._detect_reachable_host()
+    assert host == "192.168.1.42"
+    mock_sock.close.assert_called_once()
+
+
+def test_detect_reachable_host_returns_none_on_failure():
+    with patch.object(mcp_server.socket, "socket", side_effect=OSError("no network")):
+        assert mcp_server._detect_reachable_host() is None
+
+
+def test_startup_banner_prefers_explicit_public_host_override():
+    with patch.dict("os.environ", {"MCP_PUBLIC_HOST": "scan.mylab.internal"}), \
+         patch.object(mcp_server, "_detect_reachable_host", return_value="10.0.0.5"):
+        banner = mcp_server.startup_banner("0.0.0.0", 8765)
+    assert "http://scan.mylab.internal:8765/mcp" in banner
+    assert "10.0.0.5" not in banner
+
+
+def test_startup_banner_auto_detects_when_host_is_wildcard():
+    with patch.dict("os.environ", {}, clear=True), \
+         patch.object(mcp_server, "_detect_reachable_host", return_value="10.0.0.5"):
+        banner = mcp_server.startup_banner("0.0.0.0", 8765)
+    assert "http://10.0.0.5:8765/mcp" in banner
+    assert '"type": "streamableHttp"' in banner
+
+
+def test_startup_banner_includes_auto_approve_for_scan_repo():
+    with patch.dict("os.environ", {}, clear=True), \
+         patch.object(mcp_server, "_detect_reachable_host", return_value="10.0.0.5"):
+        banner = mcp_server.startup_banner("0.0.0.0", 8765)
+    expected_config = json.dumps(
+        {"mcpServers": {"it-security-agent": {
+            "type": "streamableHttp", "url": "http://10.0.0.5:8765/mcp",
+            "timeout": 300, "autoApprove": ["scan_repo"],
+        }}},
+        indent=2,
+    )
+    assert expected_config in banner
+    assert '"timeout": 300' in banner
+
+
+def test_startup_banner_uses_explicit_host_directly_when_not_wildcard():
+    with patch.dict("os.environ", {}, clear=True), \
+         patch.object(mcp_server, "_detect_reachable_host") as mock_detect:
+        banner = mcp_server.startup_banner("192.168.1.9", 8765)
+    assert "http://192.168.1.9:8765/mcp" in banner
+    mock_detect.assert_not_called()  # host is already a real address - no need to guess
+
+
+def test_startup_banner_warns_when_detection_fails():
+    with patch.dict("os.environ", {}, clear=True), \
+         patch.object(mcp_server, "_detect_reachable_host", return_value=None):
+        banner = mcp_server.startup_banner("0.0.0.0", 8765)
+    assert "MCP_PUBLIC_HOST" in banner
+    assert "http://" not in banner
+
+
+def test_scan_repo_requires_lockfile_content():
+    with pytest.raises(ValueError, match="No lockfile content"):
         mcp_server.scan_repo()
+
+
+def test_scan_repo_rejects_sbom_content_as_an_unknown_argument():
+    # This is the tamper-proofing guarantee: there is no code path that lets a
+    # caller hand over a pre-made SBOM and have it trusted directly - the
+    # parameter doesn't exist. This would fail with TypeError, not silently
+    # accept a spoofable input.
+    with pytest.raises(TypeError):
+        mcp_server.scan_repo(sbom_content="{}")
 
 
 def test_scan_repo_reports_when_nothing_parses():
