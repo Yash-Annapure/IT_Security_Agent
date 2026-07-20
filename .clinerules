@@ -1,0 +1,75 @@
+# Vulnerability scanning in this repo
+
+An MCP tool called `scan_repo` is available (server: `it-security-agent`). It
+checks this repo's dependencies against NVD, CISA KEV, and OSV.dev, and
+returns a triaged findings report. You are likely running as a small model
+(Mistral-7B-Instruct) - follow these steps literally, in order, every time.
+
+## When to use it
+
+Use `scan_repo` whenever the user asks you to check this repo (or its
+dependencies) for vulnerabilities, CVEs, or security issues. Do not answer
+that kind of question from memory or training data - always call the tool.
+
+## How to call it (do these two steps in order)
+
+1. Read the actual dependency file yourself first, with your normal file tool.
+   Look for one of these, in this order of preference:
+   - `uv.lock` or any other `*.lock` at the repo root -> pass its full text as
+     `lockfile_content`
+   - `package-lock.json` -> pass its full text as `lockfile_content`
+   - `requirements.txt` -> pass its full text as `lockfile_content`
+   - a CycloneDX or SPDX SBOM (JSON file, often under a `sbom/` or `docs/`
+     folder, or named `*.cdx.json` / `*-sbom.json`) -> pass its full text as
+     `sbom_content` instead of `lockfile_content` - the repo already has one,
+     don't generate a second
+2. Call `scan_repo` with that content as the argument. Do not summarize,
+   truncate, or retype the file yourself - pass the raw text you read.
+
+Example call shape (values are illustrative):
+```
+scan_repo(lockfile_content="<the full text of uv.lock you just read>")
+```
+
+If you can't find a lockfile, `requirements.txt`, or SBOM, say so and ask the
+user where their dependency file lives - do not guess or invent one.
+
+## SBOM generation
+
+When you call `scan_repo` with `lockfile_content` (not `sbom_content`), it
+builds a real CycloneDX SBOM from that lockfile itself and includes it in the
+response under a "Generated SBOM" heading - this repo didn't have one, so the
+tool made one as part of the scan. If the user asks for "an SBOM" specifically
+(not just a vulnerability check), that section of the response *is* the
+answer - don't say you can't generate one. If they want it saved as a file
+(e.g. `sbom.cdx.json`), write it yourself with your file tool - the MCP server
+has no access to their local filesystem, only you do.
+
+## The first call is slow - that's expected
+
+The first `scan_repo` call after the server starts (or after ~6 hours of
+uptime) can take 1-2 minutes: it's syncing NVD's CVE catalog before scanning.
+Don't retry, cancel, or report an error just because it's slow. Tell the user
+you're syncing vulnerability data and wait for the result.
+
+## How to report the result
+
+The tool's output is already organized by bucket - relay it faithfully, don't
+re-derive severity or re-decide what's a real match yourself:
+
+- **escalated** findings are actively exploited in the wild (CISA KEV) - lead
+  with these.
+- **confirmed** findings are real matches the model is confident about.
+- **review_queue** findings are uncertain - tell the user these need a human
+  to look, and pass along the "top factors" the tool gives you, don't drop
+  them.
+- **rejected** is background noise (name matched, but ruled out by version or
+  vendor) - only mention it if the user asks why a package they expected to
+  see isn't in the report.
+
+If the output says "untriaged" / "not enough labeled data," say explicitly
+that these are unscored raw matches, not confirmed vulnerabilities.
+
+Never state a CVE ID, severity, or CVSS score that isn't literally present in
+the tool's output. If the tool found nothing, say that plainly instead of
+padding the answer.
