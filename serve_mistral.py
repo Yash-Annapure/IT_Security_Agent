@@ -142,9 +142,36 @@ def parse_tool_calls(text: str) -> tuple[str, list[dict] | None]:
     return before.strip(), tool_calls
 
 
+def _flatten_content(content):
+    # Some OpenAI clients (Cline included) send `content` as a list of parts -
+    # [{"type": "text", "text": "..."}] - even for plain text messages, not just
+    # multimodal ones. Mistral's chat template assumes a plain string and does
+    # `content + "..."`, which TypeErrors on a list. Flatten to text; non-text
+    # parts (e.g. images) are silently dropped since this is a text-only model.
+    if not isinstance(content, list):
+        return content
+    parts = []
+    for part in content:
+        if isinstance(part, str):
+            parts.append(part)
+        elif isinstance(part, dict) and isinstance(part.get("text"), str):
+            parts.append(part["text"])
+    return "".join(parts)
+
+
+def _normalize_messages(messages: list[dict]) -> list[dict]:
+    normalized = []
+    for m in messages:
+        m = dict(m)
+        if "content" in m:
+            m["content"] = _flatten_content(m["content"])
+        normalized.append(m)
+    return normalized
+
+
 def run_generate(messages: list[dict], tools: list[dict] | None, max_new_tokens: int, temperature: float, top_p: float) -> str:
     inputs = tokenizer.apply_chat_template(
-        messages,
+        _normalize_messages(messages),
         tools=tools or None,
         add_generation_prompt=True,
         tokenize=True,
