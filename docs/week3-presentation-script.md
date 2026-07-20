@@ -1,6 +1,6 @@
 # Week 3 presentation script
 
-Written to be read aloud in about 3 minutes at a normal pace (roughly 140-150 words a minute). Each section is labeled with the matching section in `week3_agent.ipynb`, so you know where to have the notebook scrolled to while you say that part. Practice it once out loud before presenting, the timing below assumes you don't stop mid-sentence.
+This has grown from a tight 3-minute script into a full reference: every section, plus how to talk through each chart and where its numbers actually come from. Each heading is labeled with the matching section in `week3_agent.ipynb`, so you know where to have the notebook scrolled to. Use the priority list at the bottom to cut it back down to whatever time slot you actually have. The "How to talk through this chart" and "finding, and how we got it" blocks under Sections 4, 7, and 8 are reference material for Q&A or an extended demo, not lines to memorize, skip them first if you're short on time and the plain paragraph above them already makes the point.
 
 ---
 
@@ -26,6 +26,10 @@ Section 2: instead of hitting NVD live for every package on every scan, we sync 
 
 A confidence score by itself isn't something a person can act on. So any finding the model isn't sure about gets a SHAP explanation attached, which specific signals pushed the score up or down, so a reviewer sees a reason, not just a number.
 
+**How to talk through this chart:** it's a beeswarm plot, one dot per training example. The 7 features are stacked top to bottom by how much they matter overall, most important at the top. A dot's left-right position shows whether that signal pushed the model toward "real match" or toward "collision" for that one example, and the dot's color shows whether the feature's value was high or low there.
+
+**The finding, and how we got it:** we ran this same plot across all 17,090 labeled rows from Section 3. The two features that matter most turn out not to be the obvious one. `keyword_alignment` and `osv_corroborated` do most of the separating, not raw name similarity. A perfect name match with nothing else backing it up actually pushes toward "collision," not away from it, the exact pattern Section 9 finds live in `babel` and `json5`.
+
 ## Notebook Sections 5 and 6 — "The agent: triage every match into four buckets" / "Report output"
 
 *Cue: pipeline used to stop at a score, now a full triage policy.*
@@ -37,6 +41,14 @@ This used to just produce a score and stop. Now there's an actual policy. Anythi
 *Cue: Section 3 picked a winner by one number, now we show our work on why, down to specific examples.*
 
 Sections 7 and 8 go a level deeper on the model. Section 3 picked the random forest by risk score alone, one number. Section 7 shows why: the confusion matrix for both models on the same held-out data, and which features each one actually leans on. The important part is `registry_overlap`, the one signal that actually separates a real match from a collision, is deliberately kept out of both models' features, it's the label, not an input, so neither model can just look it up. Section 8 then walks two real findings through the exact same explanation function `agent.py` uses for every review-queue case, so what's on screen is literally what a human reviewer would see, not a summary of it.
+
+**Section 7's chart, how to talk through it:** two horizontal bar charts side by side, one per model, same 7 features on both. The logistic regression bars can point left or right, since its coefficients have a direction, a feature can push toward "real match" or away from it. The random forest bars only point one way, it just reports how much each feature mattered, not which direction, that's how random forests work, not an inconsistency to explain away.
+
+**Section 7's finding, and how we got it:** we ran both models against the same held-out 30 percent of the data and pulled the actual confusion matrix for each. Logistic regression missed 0 real matches but kept 507 collisions as false positives. Random forest missed 1 real match but only kept 166. That single extra miss out of roughly 600 real matches in the test set buys a false-positive count less than a third the size, which is why it wins on the risk score, 176 versus 507.
+
+**Section 8's chart, how to talk through it:** same beeswarm idea as Section 4, but zoomed into one feature, `keyword_alignment`. The x-axis is the raw score itself, how clearly a CVE's own text reads as Python versus JavaScript. The y-axis is how much that value moved the prediction. Dots trending upward left to right is confirmation the feature is doing what it was designed to do.
+
+**Section 8's finding, and how we got it:** we built two hand-picked rows with the exact same perfect name-similarity score, one with matching keyword and OSV evidence, one without, and ran both through the same explanation function a reviewer would see. Identical name match, opposite outcome: confidence 0.92 and confirmed for one, confidence 0.01 and sent to review for the other. Name similarity alone was never enough to tell a real match from a collision, that's the whole reason the other six features exist.
 
 ## Notebook Section 9 — "Weakness check: did we actually fix Week 2's name collisions?"
 
@@ -56,13 +68,14 @@ And this whole pipeline is now wired up so Cline, an AI coding assistant, can ca
 
 ---
 
-**Rough timing:** opening 10s, Section 1 about 20-25s, Sections 2/3 combined about 40-45s, Section 4 about 20s, Sections 5/6 combined about 25-30s, Sections 7/8 combined about 50-55s, Section 9 about 35-40s, Section 10 about 50-55s, closing 10-15s. That's now roughly 4:20 to 4:40 with every notebook section covered, well past the original 3-minute target.
+**Rough timing:** the plain "say this" paragraphs alone (no chart breakdowns) still run about 4:20 to 4:40. Add the chart-reading and findings blocks under Sections 4, 7, and 8 and the whole thing runs closer to 7:30-8:00. Neither is a 3-minute script anymore, so use the priority order below rather than reading top to bottom.
 
-This is now a full walkthrough script, not a 3-minute one. If you're actually presenting in 3 minutes, here's the priority order for cutting, highest-value first (keep these), lowest-value last (cut these first):
+Priority order for cutting, highest-value first (keep these), lowest-value last (cut these first):
 
 1. Keep: Opening, Section 9 (the weakness audit), closing (the Cline demo). These are the three moments that make the talk memorable, not just correct.
 2. Keep if time allows: Section 1, Sections 2/3, Sections 5/6. This is the actual pipeline story.
-3. Cut first: Sections 7/8. They elaborate on Sections 3/4 rather than covering new ground.
-4. Cut second: Section 10. Real and worth having in the full script, but the least essential to the story if you're forced to choose.
+3. Cut first: the "How to talk through this chart" / "finding, and how we got it" blocks under Sections 4, 7, and 8. Keep them in your back pocket for if someone asks "wait, what does that graph mean," but they're the first thing to skip while talking.
+4. Cut next: Sections 7/8's plain paragraph too. It elaborates on Sections 3/4 rather than covering new ground.
+5. Cut last: Section 10. Real and worth having, but the least essential to the story if you're still over time.
 
-Cutting 3 and 4 gets you back to roughly the original 3:00-3:15 version.
+Cutting 3 and 4 gets you back to roughly the original 3:00-3:15 version. Cutting just 3 keeps every section but trims the deep-dive material, landing around 4:20-4:40.
