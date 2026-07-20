@@ -28,7 +28,9 @@ A confidence score by itself isn't something a person can act on. So any finding
 
 **How to talk through this chart:** it's a beeswarm plot, one dot per training example. The 7 features are stacked top to bottom by how much they matter overall, most important at the top. A dot's left-right position shows whether that signal pushed the model toward "real match" or toward "collision" for that one example, and the dot's color shows whether the feature's value was high or low there.
 
-**The finding, and how we got it:** we ran this same plot across all 17,090 labeled rows from Section 3. The two features that matter most turn out not to be the obvious one. `keyword_alignment` and `osv_corroborated` do most of the separating, not raw name similarity. A perfect name match with nothing else backing it up actually pushes toward "collision," not away from it, the exact pattern Section 9 finds live in `babel` and `json5`.
+**The finding, and how we got it:** we ran this same plot across all 17,080 labeled rows from Section 3, using the model's actual SHAP values now that the chart is fixed (see the note below, this changed the answer, not just the picture). `name_similarity` and `vendor_equals_package` are the two features with the widest spread, meaning they move the prediction the most across the training set. `keyword_alignment` is third. `osv_corroborated` and `ecosystem_pypi` barely move the needle in aggregate. That doesn't make name similarity a safe shortcut though, Section 8's worked examples show the exact same perfect name-similarity score contributing in opposite directions depending on what else is true, which is the actual reason the other six features exist.
+
+**Before you present this one, and this matters more than the usual "chart fix" note:** the cell that builds this chart had a real bug, it plotted the raw multi-class SHAP output instead of slicing to the "real match" class first, the same slice `explain.explain_match()` already did elsewhere but this chart never applied. It's fixed now (cell `a17609df`), already re-run, and the finding above is from that corrected run. The earlier version of this script (and the notebook's own Summary cell, also now fixed) claimed `keyword_alignment` and `osv_corroborated` mattered most, that claim was itself downstream of the bug, not a real result. If you rehearsed the old version, rehearse this one again, the headline flipped.
 
 ## Notebook Sections 5 and 6 — "The agent: triage every match into four buckets" / "Report output"
 
@@ -44,11 +46,17 @@ Sections 7 and 8 go a level deeper on the model. Section 3 picked the random for
 
 **Section 7's chart, how to talk through it:** two horizontal bar charts side by side, one per model, same 7 features on both. The logistic regression bars can point left or right, since its coefficients have a direction, a feature can push toward "real match" or away from it. The random forest bars only point one way, it just reports how much each feature mattered, not which direction, that's how random forests work, not an inconsistency to explain away.
 
-**Section 7's finding, and how we got it:** we ran both models against the same held-out 30 percent of the data and pulled the actual confusion matrix for each. Logistic regression missed 0 real matches but kept 507 collisions as false positives. Random forest missed 1 real match but only kept 166. That single extra miss out of roughly 600 real matches in the test set buys a false-positive count less than a third the size, which is why it wins on the risk score, 176 versus 507.
+**Section 7's finding, and how we got it:** we ran both models against the same held-out 30 percent of the data and pulled the actual confusion matrix for each. Logistic regression missed 0 real matches but kept 494 collisions as false positives. Random forest missed 1 real match but only kept 166. That single extra miss out of roughly 600 real matches in the test set buys a false-positive count less than a third the size, which is why it wins on the risk score, 176 versus 494.
 
 **Section 8's chart, how to talk through it:** same beeswarm idea as Section 4, but zoomed into one feature, `keyword_alignment`. The x-axis is the raw score itself, how clearly a CVE's own text reads as Python versus JavaScript. The y-axis is how much that value moved the prediction. Dots trending upward left to right is confirmation the feature is doing what it was designed to do.
 
-**Section 8's finding, and how we got it:** we built two hand-picked rows with the exact same perfect name-similarity score, one with matching keyword and OSV evidence, one without, and ran both through the same explanation function a reviewer would see. Identical name match, opposite outcome: confidence 0.92 and confirmed for one, confidence 0.01 and sent to review for the other. Name similarity alone was never enough to tell a real match from a collision, that's the whole reason the other six features exist.
+**Section 8's finding, and how we got it:** we built two hand-picked rows with the exact same perfect name-similarity score, one with matching keyword and OSV evidence, one without, and ran both through the same explanation function a reviewer would see. Identical name match, opposite outcome: confidence 0.91 and confirmed for one, confidence 0.01 and sent to review for the other. Name similarity alone was never enough to tell a real match from a collision, that's the whole reason the other six features exist, and it's consistent with Section 4's corrected finding above, name similarity matters most on average, but "matters most" isn't the same as "decides alone."
+
+**Section 8 also now has a new chart, added after the two worked examples: interaction values.** Where the earlier charts show what one feature does on its own, this one shows whether two features together move the prediction more than either alone. It's narrowed to `name_similarity`, `keyword_alignment`, and `osv_corroborated`, a full 7-feature version exists but renders as 49 tiny unreadable panels, so this keeps it to a 3x3 grid instead.
+
+**How to talk through it:** same dot-per-example idea as the other SHAP charts, but each of the 9 small panels is one pair of those 3 features. A panel where the dots spread out and trend in a clear direction means that pair interacts, the model's use of one of them depends on the value of the other. A flat, scattered panel means they act independently.
+
+**The finding, now actually run against the real model:** `name_similarity`'s row is the one with the widest spread across all three panels, consistent with Section 4, it dominates the pairwise view too, not `keyword_alignment` or `osv_corroborated`. The other two features' panels are comparatively flat. If you're only pointing at one panel live, point at the `name_similarity` row.
 
 ## Notebook Section 9 — "Weakness check: did we actually fix Week 2's name collisions?"
 
@@ -68,14 +76,16 @@ And this whole pipeline is now wired up so Cline, an AI coding assistant, can ca
 
 ---
 
-**Rough timing:** the plain "say this" paragraphs alone (no chart breakdowns) still run about 4:20 to 4:40. Add the chart-reading and findings blocks under Sections 4, 7, and 8 and the whole thing runs closer to 7:30-8:00. Neither is a 3-minute script anymore, so use the priority order below rather than reading top to bottom.
+**Rough timing:** the plain "say this" paragraphs alone (no chart breakdowns) still run about 4:20 to 4:40. Add the chart-reading and findings blocks under Sections 4, 7, and 8, including the new interaction-values addition, and the whole thing runs closer to 8:00-8:30. Neither is a 3-minute script anymore, so use the priority order below rather than reading top to bottom.
 
 Priority order for cutting, highest-value first (keep these), lowest-value last (cut these first):
 
 1. Keep: Opening, Section 9 (the weakness audit), closing (the Cline demo). These are the three moments that make the talk memorable, not just correct.
 2. Keep if time allows: Section 1, Sections 2/3, Sections 5/6. This is the actual pipeline story.
-3. Cut first: the "How to talk through this chart" / "finding, and how we got it" blocks under Sections 4, 7, and 8. Keep them in your back pocket for if someone asks "wait, what does that graph mean," but they're the first thing to skip while talking.
+3. Cut first: every "How to talk through this chart" / "finding, and how we got it" block under Sections 4, 7, and 8, including the new interaction-values block. Keep them in your back pocket for if someone asks "wait, what does that graph mean," but they're the first thing to skip while talking.
 4. Cut next: Sections 7/8's plain paragraph too. It elaborates on Sections 3/4 rather than covering new ground.
 5. Cut last: Section 10. Real and worth having, but the least essential to the story if you're still over time.
+
+One more thing before you present, not just before you cut: Sections 4 and 8 both got real code changes just now (a bug fix and a new chart). Re-run Sections 3, 4, and the new Section 8 cell once so the charts on screen match what this script describes, don't present off of stale output.
 
 Cutting 3 and 4 gets you back to roughly the original 3:00-3:15 version. Cutting just 3 keeps every section but trims the deep-dive material, landing around 4:20-4:40.
