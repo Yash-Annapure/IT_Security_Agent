@@ -13,37 +13,41 @@ that kind of question from memory or training data - always call the tool.
 
 ## How to call it (do these two steps in order)
 
-1. Read the actual dependency file yourself first, with your normal file tool.
-   Look for one of these, in this order of preference:
-   - `uv.lock` or any other `*.lock` at the repo root -> pass its full text as
-     `lockfile_content`
-   - `package-lock.json` -> pass its full text as `lockfile_content`
-   - `requirements.txt` -> pass its full text as `lockfile_content`
-   - a CycloneDX or SPDX SBOM (JSON file, often under a `sbom/` or `docs/`
-     folder, or named `*.cdx.json` / `*-sbom.json`) -> pass its full text as
-     `sbom_content` instead of `lockfile_content` - the repo already has one,
-     don't generate a second
-2. Call `scan_repo` with that content as the argument. Do not summarize,
-   truncate, or retype the file yourself - pass the raw text you read.
+1. Read the repo's actual lockfile yourself first, with your normal file tool.
+   Look for one of these, in this order of preference: `uv.lock` (or any other
+   `*.lock`), `package-lock.json`, `requirements.txt`.
+2. Call `scan_repo` with that file's full text as `lockfile_content`. Do not
+   summarize, truncate, or retype the file yourself - pass the raw text you
+   read.
 
 Example call shape (values are illustrative):
 ```
 scan_repo(lockfile_content="<the full text of uv.lock you just read>")
 ```
 
-If you can't find a lockfile, `requirements.txt`, or SBOM, say so and ask the
-user where their dependency file lives - do not guess or invent one.
+If you can't find a lockfile, say so and ask the user where their dependency
+file lives - do not guess or invent one.
 
-## SBOM generation
+## There is no "pass in an existing SBOM" option - this is intentional
 
-When you call `scan_repo` with `lockfile_content` (not `sbom_content`), it
-builds a real CycloneDX SBOM from that lockfile itself and includes it in the
-response under a "Generated SBOM" heading - this repo didn't have one, so the
-tool made one as part of the scan. If the user asks for "an SBOM" specifically
-(not just a vulnerability check), that section of the response *is* the
-answer - don't say you can't generate one. If they want it saved as a file
-(e.g. `sbom.cdx.json`), write it yourself with your file tool - the MCP server
-has no access to their local filesystem, only you do.
+`scan_repo` only accepts `lockfile_content`. If you find an existing SBOM file
+in the repo (CycloneDX/SPDX JSON, e.g. under `sbom/` or named `*.cdx.json`),
+do **not** read it and do **not** pass its content to the tool - there is no
+parameter for that, and passing it as `lockfile_content` will fail to parse or
+silently return nothing useful. This tool is built to be tamper-proof: a
+pre-made SBOM is an unverified claim about what's pinned, and could be stale
+or doctored to omit a vulnerable package with no way for either of us to
+tell. The lockfile is the only thing it treats as ground truth, and it builds
+its own SBOM from that lockfile itself, every call - it never trusts one
+handed to it.
+
+If the user asks for "an SBOM" specifically (not just a vulnerability check),
+`scan_repo`'s response includes one anyway - a "Generated SBOM" section built
+fresh from the lockfile you gave it. That section *is* the answer; don't say
+you can't generate one, and don't go looking for a pre-existing SBOM file to
+use instead. If the user wants it saved as a file (e.g. `sbom.cdx.json`),
+write it yourself with your file tool - the MCP server has no access to
+their local filesystem, only you do.
 
 ## The first call is slow - that's expected
 
