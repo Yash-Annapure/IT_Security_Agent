@@ -72,6 +72,16 @@ def test_get_setup_rules_raises_clearly_if_bundled_file_is_missing():
             mcp_server.get_setup_rules()
 
 
+def test_scan_repo_rejects_unexpanded_shell_substitution_with_clear_error():
+    with pytest.raises(ValueError, match="unexpanded shell command substitution"):
+        mcp_server.scan_repo(lockfile_content="$(type uv.lock)", lockfile_type="uv.lock")
+
+
+def test_scan_repo_rejects_ellipsis_placeholder_with_clear_error():
+    with pytest.raises(ValueError, match="placeholder/ellipsis stub"):
+        mcp_server.scan_repo(lockfile_content="{ ... (lockfile content) ... }")
+
+
 def test_get_connection_caches_across_calls():
     mcp_server._conn = None
     try:

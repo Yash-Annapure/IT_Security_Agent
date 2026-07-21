@@ -50,7 +50,7 @@ from threading import Lock
 
 import torch
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import Request
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -58,6 +58,16 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2.5-7B-Instruct")
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8000"))
+
+# Qwen2.5-7B-Instruct's real trained context is 32768 tokens - not the tokenizer's much
+# higher default model_max_length sanity-check value, which only catches truly absurd
+# inputs and does nothing to stop a prompt that overshoots the model's actual positional
+# embeddings. This project hit that directly: a 176,548-character raw uv.lock pushed one
+# request to ~135,000 tokens, which both exceeded the model's real limit *and* OOM'd the
+# GPU allocating KV-cache space for it. Reject oversized prompts before model.generate()
+# ever runs instead of finding out via a CUDA crash. Leave headroom below 32768 for
+# max_new_tokens plus the templating overhead apply_chat_template adds.
+MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "28000"))
 TOOL_CALL_START = "<tool_call>"
 TOOL_CALL_END = "</tool_call>"
 
@@ -229,6 +239,20 @@ def run_generate(messages: list[dict], tools: list[dict] | None, max_new_tokens:
         return_dict=True,
     ).to(model.device)
 
+    input_len = inputs["input_ids"].shape[1]
+    if input_len > MAX_INPUT_TOKENS:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Prompt is {input_len} tokens, over this server's {MAX_INPUT_TOKENS}-token "
+                f"limit (kept safely under the model's real 32768-token context, leaving "
+                f"room to actually generate a response). This almost always means a full "
+                f"raw lockfile ended up in the conversation instead of a condensed one - "
+                f"run condense_lockfile.py on it first (see README.md and "
+                f".clinerules/scan-repo.md) rather than reading the raw file directly."
+            ),
+        )
+
     if DEBUG_PROMPT:
         rendered = tokenizer.decode(inputs["input_ids"][0])
         print(f"----- RENDERED PROMPT ({len(rendered)} chars) -----", flush=True)
@@ -249,8 +273,17 @@ def run_generate(messages: list[dict], tools: list[dict] | None, max_new_tokens:
     else:
         gen_kwargs.update(do_sample=False)
 
-    with generate_lock, torch.no_grad():
-        output_ids = model.generate(**gen_kwargs)
+    try:
+        with generate_lock, torch.no_grad():
+            output_ids = model.generate(**gen_kwargs)
+    finally:
+        # Plain transformers .generate() (unlike vLLM's paged attention) doesn't reclaim
+        # its KV-cache allocations on its own between requests - on a long-running server
+        # process, cached-but-unused CUDA blocks pile up across calls and shrink the free
+        # VRAM available to the next one. Release them back to the allocator every call,
+        # success or failure, so a long session doesn't slowly starve itself of headroom.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     new_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
     return tokenizer.decode(new_tokens, skip_special_tokens=True)

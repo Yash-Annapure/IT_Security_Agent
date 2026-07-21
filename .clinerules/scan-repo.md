@@ -25,21 +25,40 @@ re-describing the plan on every reply.
 
 ## How to call it (do these two steps in order)
 
-1. Read the repo's actual lockfile yourself first, with your normal file tool.
-   Look for one of these **at the root of the project you were asked to scan**
-   (not your currently open editor tab, not a file mentioned earlier in this
-   conversation for some other reason) - in this order of preference: `uv.lock`
-   (or any other `*.lock`), `package-lock.json`, `requirements.txt`.
-2. Call `scan_repo` with `lockfile_content` set to the literal file contents
-   you just read in step 1 - the real text, substituted in, not a description
-   of it and not a placeholder string. If you have not actually read a real
-   lockfile yet, do not call this tool - go do step 1 first.
+1. Find the repo's actual lockfile at **the root of the project you were
+   asked to scan** (not your currently open editor tab, not a file mentioned
+   earlier in this conversation for some other reason) - in this order of
+   preference: `uv.lock` (or any other `*.lock`), `package-lock.json`,
+   `requirements.txt`.
+2. Run `condense_lockfile.py <that file>` with your terminal tool (e.g.
+   `uv run condense_lockfile.py uv.lock`, or `python condense_lockfile.py
+   package-lock.json`), then call `scan_repo` with `lockfile_content` set to
+   exactly what that command printed to stdout.
+
+**Always condense first - never `type`/`cat` the raw lockfile into the
+conversation, and never pass the raw file's content directly.** Raw lockfiles
+are mostly per-platform wheel/sdist download URLs and hashes that
+`scan_repo`'s own parser throws away anyway; on a real dependency tree that
+noise is large enough to overflow your entire context window in a single
+message - this project hit exactly that (one raw lockfile crashed the model
+server with an out-of-memory error). `condense_lockfile.py` strips that noise
+to just name/version pairs using the same parser `scan_repo` uses
+server-side, so the scan result is identical either way - condensing loses
+nothing that matters to vulnerability matching, only bytes it never needed.
 
 Before calling the tool, sanity-check your own `lockfile_content` value: does
-it contain actual package names and version numbers from a real dependency
-file? If it looks like a description, a filename, angle brackets, or anything
-other than literal file content, you have not done step 1 yet - stop and read
-the file for real first.
+it contain actual package names and version numbers? If it looks like a
+description, a filename, angle brackets, an ellipsis, or **literal shell
+syntax you expected to be expanded** (e.g. `$(type uv.lock)`, backticks,
+`%VAR%`) - MCP tool arguments are never run through a shell, nothing expands
+that for you - you have not actually run the condense command yet. Go run it
+for real and use the text it printed, not a description of what it would
+print.
+
+If `scan_repo` returns an error, read what it says - the error explains what
+was wrong with what you sent. Do not retry the exact same call unchanged; it
+will fail the exact same way every time. Fix what the error describes, then
+call it again.
 
 If you can't find a lockfile at the project root, say so and ask the user
 where their dependency file lives - do not guess or invent one, and do not

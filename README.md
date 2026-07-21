@@ -92,19 +92,20 @@ There's no built-in auth, so only expose this on a private/trusted network.
 A `.env` file with `NVD_API_KEY` is optional but strongly recommended -
 without it every NVD/CPE request is spaced 6s apart instead of 1s.
 
-Separately, host Mistral-7B-Instruct with tool calling on the same box:
+Separately, host Qwen2.5-7B-Instruct with tool calling on the same box:
 ```
-vllm serve mistralai/Mistral-7B-Instruct-v0.3 \
+vllm serve Qwen/Qwen2.5-7B-Instruct \
   --host 0.0.0.0 --port 8000 \
-  --enable-auto-tool-choice --tool-call-parser mistral
+  --enable-auto-tool-choice --tool-call-parser hermes
 ```
-`--enable-auto-tool-choice` and `--tool-call-parser mistral` are both
-required for vLLM to parse Mistral's tool-call output correctly. If tool
-calls come back malformed, add `--chat-template
-examples/tool_chat_template_mistral.jinja` (from the vLLM repo checkout) -
-some Mistral-7B-Instruct revisions need the explicit template. Any other
-OpenAI-compatible server (TGI, Ollama, etc.) works the same way from Cline's
-side; only the serving command differs.
+Qwen2.5's own `tokenizer_config.json` already ships a working tool-calling
+chat template (hermes-style `<tool_call>` blocks) - unlike Mistral, no
+`--chat-template` override is needed. Any other OpenAI-compatible server
+(TGI, Ollama, `serve_mistral.py` in this repo, etc.) works the same way from
+Cline's side; only the serving command differs. Note Qwen2.5-7B-Instruct's
+real context is 32768 tokens - see "Keeping lockfiles small enough to fit in
+context" below, since a raw lockfile can overflow that in one message on a
+real dependency tree.
 
 ### In Cline (VS Code extension)
 
@@ -112,7 +113,7 @@ side; only the serving command differs.
 - Base URL: `http://<datalab-server>:8000/v1`
 - API Key: any non-empty placeholder (vLLM ignores it unless you've
   configured auth)
-- Model ID: `mistralai/Mistral-7B-Instruct-v0.3`
+- Model ID: `Qwen/Qwen2.5-7B-Instruct`
 
 **Tool** - "Configure MCP Servers" -> paste the JSON block `serve.py` printed.
 
@@ -123,16 +124,41 @@ timeout is much shorter and will otherwise report a false failure.
 ### Use it
 
 In Cline, open this repo and ask something like "check this repo's
-dependencies for vulnerabilities." `.clinerules/` tells the model to read the
-lockfile itself and call `scan_repo` with its content - no further prompting
-needed. The tool has no parameter for a pre-made SBOM at all, by design (see
-the tamper-proofing note above) - `.clinerules/` also tells the model not to
-go looking for one.
+dependencies for vulnerabilities." `.clinerules/` tells the model to condense
+the lockfile (see below), then call `scan_repo` with the condensed content -
+no further prompting needed. The tool has no parameter for a pre-made SBOM at
+all, by design (see the tamper-proofing note above) - `.clinerules/` also
+tells the model not to go looking for one.
 
 If you ask for "an SBOM" and the repo only has a lockfile, `scan_repo`
 generates one from it (a real CycloneDX document, not a description of one)
 and returns it inline alongside the findings - `.clinerules/` tells the model
 this counts as the answer, not a "can't do that" response.
+
+### Keeping lockfiles small enough to fit in context
+
+`condense_lockfile.py` (repo root) strips a lockfile down to just
+`name==version` pairs (or the npm equivalent), using the exact same parser
+`scan_repo` uses server-side - the scan result is identical either way, since
+wheel/sdist URLs and hashes were never part of what gets matched against
+NVD/KEV/OSV anyway. On this repo's own `uv.lock` that's a ~99.5% size cut
+(618KB -> 3KB, 158 packages). Run it before calling `scan_repo`:
+
+```
+uv run condense_lockfile.py uv.lock
+```
+
+`.clinerules/` tells the model to always do this instead of reading the raw
+lockfile directly. This matters more than it sounds: a raw lockfile is often
+large enough to overflow a small local model's entire context window in one
+message - this project hit that directly (a 176,548-character raw `uv.lock`
+pushed one request to ~135,000 tokens against Qwen2.5-7B-Instruct's real
+32768-token context, and crashed the GPU with a CUDA out-of-memory error
+trying to allocate KV-cache space for it). `serve_mistral.py` now also
+rejects any prompt over `MAX_INPUT_TOKENS` (default 28000, override via env
+var) with a clear HTTP 413 before calling `model.generate()`, so an oversized
+prompt fails cleanly instead of crashing the server - but condensing first is
+what actually avoids hitting that limit on a real dependency tree.
 
 ### Using it against a different repo for the first time
 

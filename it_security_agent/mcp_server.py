@@ -98,6 +98,30 @@ def _detect_lockfile_type(content: str) -> str:
     return "requirements.txt"  # plain text, no structural marker - the fallback guess
 
 
+def _placeholder_reason(content: str) -> str | None:
+    """Returns a human-readable reason if `content` looks like a caller never actually
+    substituted real file content - a shell-substitution string it expected to be
+    expanded, a `{ ... }` stub, an ellipsis - rather than None if it looks like real text.
+
+    This exists because a raw parser error ("Invalid statement (at line 1, column 1)" from
+    a TOML parser choking on "$(type uv.lock)") is a cryptic, unhelpful signal for both a
+    human and a small model to act on - this turns it into something actionable, and turns
+    a swallowed failure into a real one instead of quietly returning nothing useful.
+    """
+    stripped = content.strip()
+    if stripped.startswith("$(") and stripped.endswith(")"):
+        return (
+            "looks like unexpanded shell command substitution syntax (e.g. \"$(type "
+            "uv.lock)\") - MCP tool arguments are never run through a shell, so this was "
+            "never substituted with real content"
+        )
+    if "`" in stripped and len(stripped) < 200:
+        return "looks like a shell command (backticks) rather than real file content"
+    if len(stripped) < 500 and "..." in stripped:
+        return "looks like a placeholder/ellipsis stub rather than real file content"
+    return None
+
+
 def parse_lockfile_components(lockfile_content, lockfile_type=None):
     kind = lockfile_type or _detect_lockfile_type(lockfile_content)
     if kind == "uv.lock":
@@ -288,6 +312,14 @@ def scan_repo(
             "requirements.txt yourself first, then call this tool again with its contents as "
             "lockfile_content. This tool does not accept a pre-made SBOM - it always builds "
             "its own from the lockfile, by design."
+        )
+
+    reason = _placeholder_reason(lockfile_content)
+    if reason is not None:
+        raise ValueError(
+            f"lockfile_content {reason}. Read the repo's actual lockfile with your own "
+            "file tool (or condense_lockfile.py's output - see README.md) and pass its "
+            "real text here instead."
         )
 
     components = parse_lockfile_components(lockfile_content, lockfile_type)
