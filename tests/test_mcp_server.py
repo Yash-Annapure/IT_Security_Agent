@@ -207,6 +207,28 @@ def test_scan_http_endpoint_streams_keepalive_header_before_the_report():
     # The keepalive preamble (what defeats Cloudflare's ~100s proxy timeout) comes
     # first, then the report.
     assert resp.text.index("Scanning") < resp.text.index("Vulnerability scan result")
+    # Trailing newline: without it, terminal integrations glue their shell-prompt
+    # artifacts onto the report's last line (seen in practice).
+    assert resp.text.endswith("\n")
+
+
+def test_scan_http_endpoint_scans_every_component_with_no_cap():
+    # 45 components - more than scan_repo's MCP-tool default cap of 40. /scan is the
+    # primary path and must test every single package in the lockfile.
+    lock = "\n".join(
+        f'[[package]]\nname = "pkg{i}"\nversion = "1.0.0"\nsource = {{ registry = "https://pypi.org/simple" }}\n'
+        for i in range(45)
+    )
+    with patch.object(mcp_server, "get_connection", return_value="conn"), \
+         patch.object(mcp_server, "_ensure_synced"), \
+         patch.object(mcp_server, "prewarm"), \
+         patch.object(mcp_server, "run_pipeline", return_value=None), \
+         patch.object(mcp_server, "raw_matches", return_value=[]) as mock_raw:
+        resp = _http_client().post("/scan", content=lock.encode("utf-8"))
+    assert resp.status_code == 200
+    scanned = mock_raw.call_args[0][0]
+    assert len(scanned) == 45  # all of them, not the first 40
+    assert "capped by max_components" not in resp.text
 
 
 def _http_client():

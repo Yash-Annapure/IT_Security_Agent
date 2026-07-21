@@ -379,8 +379,10 @@ def get_scan_command(ctx: Context) -> str:
         "Run exactly ONE of these in the terminal, as printed - substituting only the "
         "lockfile filename after the @ if it isn't uv.lock:\n\n"
         f"  Windows PowerShell (use this one on Windows - plain `curl` will NOT work "
-        f"there):\n    curl.exe -s -X POST {base}/scan --data-binary '@uv.lock'\n\n"
+        f"there):\n    curl.exe -s -X POST {base}/scan --data-binary \"@uv.lock\"\n\n"
         f"  bash / zsh (Linux/macOS):\n    curl -s -X POST {base}/scan --data-binary @uv.lock\n\n"
+        "The quotes around \"@uv.lock\" are REQUIRED on PowerShell - an unquoted @ is "
+        "a parse error there. Copy them exactly.\n\n"
         "The command streams: it first prints a 'Scanning' line and keepalive dots "
         "while the server works (usually seconds; up to ~2 minutes on the first run "
         "after a server restart) - wait for it to finish, don't retry or cancel. "
@@ -636,7 +638,8 @@ async def scan_http_endpoint(request):
     # Parsing is pure and fast - validate it up front so garbage input still gets a
     # proper 400 status, which is impossible once the streamed 200 has started.
     try:
-        if not parse_lockfile_components(text):
+        components = parse_lockfile_components(text)
+        if not components:
             return PlainTextResponse("No components could be parsed from the provided lockfile.", status_code=400)
     except Exception as exc:
         return PlainTextResponse(f"Could not parse lockfile: {exc}", status_code=400)
@@ -647,7 +650,11 @@ async def scan_http_endpoint(request):
 
     def work():
         try:
-            outcome["report"] = _run_scan(text, "", 40, include_sbom)
+            # No component cap here, unlike scan_repo's MCP default of 40: this is the
+            # primary path and every package in the lockfile gets scanned. Streaming
+            # keeps the connection alive however long that takes, so there's no
+            # latency ceiling forcing a cap anymore.
+            outcome["report"] = _run_scan(text, "", len(components), include_sbom)
         except Exception as exc:
             outcome["error"] = str(exc)
 
@@ -659,10 +666,12 @@ async def scan_http_endpoint(request):
             await anyio.sleep(5)
             yield b"."
         yield b"\n\n"
+        # Both branches end with a newline: without one, terminal integrations glue
+        # their own shell-prompt artifacts onto the report's last line.
         if "error" in outcome:
-            yield f"ERROR: {outcome['error']}".encode("utf-8")
+            yield f"ERROR: {outcome['error']}\n".encode("utf-8")
         else:
-            yield outcome["report"].encode("utf-8")
+            yield (outcome["report"] + "\n").encode("utf-8")
 
     return StreamingResponse(stream(), media_type="text/plain")
 

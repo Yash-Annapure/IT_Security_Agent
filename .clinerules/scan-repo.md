@@ -11,7 +11,7 @@ do them in order, every time, nothing more:
 2. **Run that command in the terminal, exactly as printed.** This machine
    uses Windows PowerShell, so use the `curl.exe` line (plain `curl` does
    NOT work in PowerShell - it's an alias for a different command, and an
-   unquoted `@` is a parse error there; the `curl.exe ... '@uv.lock'` line
+   unquoted `@` is a parse error there; the `curl.exe ... "@uv.lock"` line
    avoids both). If the repo's lockfile isn't `uv.lock`, substitute the
    real filename after the `@` - that is the ONLY change you may make.
    The command streams: it prints a "Scanning" line and keepalive dots
