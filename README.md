@@ -74,16 +74,17 @@ Paste into Cline -> "Configure MCP Servers" (merge into an existing
       "type": "streamableHttp",
       "url": "http://192.168.1.42:8765/mcp",
       "timeout": 300,
-      "autoApprove": ["scan_repo"]
+      "autoApprove": ["condense_lockfile", "scan_repo"]
     }
   }
 }
 ```
 
 Copy that URL and JSON block directly - nothing to fill in by hand.
-`autoApprove` skips Cline's per-call confirmation prompt for `scan_repo`
-(safe to leave in - it never writes to or executes anything on the caller's
-machine; drop it from the list if you'd rather approve each scan by hand).
+`autoApprove` skips Cline's per-call confirmation prompt for
+`condense_lockfile` and `scan_repo` (safe to leave in - neither writes to or
+executes anything on the caller's machine; drop either name from the list
+if you'd rather approve those calls by hand).
 It auto-detects the box's LAN-reachable IP; if that's wrong for your network
 (behind NAT, inside a container, etc.), set `MCP_PUBLIC_HOST` to the correct
 address/hostname and restart. `MCP_PORT` overrides the port (default 8765).
@@ -124,11 +125,12 @@ timeout is much shorter and will otherwise report a false failure.
 ### Use it
 
 In Cline, open this repo and ask something like "check this repo's
-dependencies for vulnerabilities." `.clinerules/` tells the model to condense
-the lockfile (see below), then call `scan_repo` with the condensed content -
-no further prompting needed. The tool has no parameter for a pre-made SBOM at
-all, by design (see the tamper-proofing note above) - `.clinerules/` also
-tells the model not to go looking for one.
+dependencies for vulnerabilities." `.clinerules/` tells the model to read the
+lockfile itself, call the `condense_lockfile` MCP tool on it, then call
+`scan_repo` with the condensed result - no further prompting needed, and no
+terminal command anywhere in that chain. The tool has no parameter for a
+pre-made SBOM at all, by design (see the tamper-proofing note above) -
+`.clinerules/` also tells the model not to go looking for one.
 
 If you ask for "an SBOM" and the repo only has a lockfile, `scan_repo`
 generates one from it (a real CycloneDX document, not a description of one)
@@ -137,28 +139,39 @@ this counts as the answer, not a "can't do that" response.
 
 ### Keeping lockfiles small enough to fit in context
 
-`condense_lockfile.py` (repo root) strips a lockfile down to just
-`name==version` pairs (or the npm equivalent), using the exact same parser
-`scan_repo` uses server-side - the scan result is identical either way, since
-wheel/sdist URLs and hashes were never part of what gets matched against
-NVD/KEV/OSV anyway. On this repo's own `uv.lock` that's a ~99.5% size cut
-(618KB -> 3KB, 158 packages). Run it before calling `scan_repo`:
+`condense_lockfile` is an MCP tool (same server, alongside `scan_repo`) that
+strips a lockfile down to just `name==version` pairs (or the npm
+equivalent), using the exact same parser `scan_repo` uses server-side - the
+scan result is identical either way, since wheel/sdist URLs and hashes were
+never part of what gets matched against NVD/KEV/OSV anyway. On this repo's
+own `uv.lock` that's a ~99.5% size cut (618KB -> 3KB, 158 packages).
+`.clinerules/` tells the model to always call it before `scan_repo`, instead
+of reading the raw lockfile directly into the conversation.
 
-```
-uv run condense_lockfile.py uv.lock
-```
+It's deliberately an MCP tool rather than a terminal script: an earlier
+version of this workflow used a `condense_lockfile.py` script the model had
+to invoke via its terminal tool, and in practice the model sometimes
+generalized that pattern to `scan_repo` too - trying to run it as a script,
+a Python module, or a CLI command that doesn't exist, none of which work,
+since `scan_repo` only exists as an MCP tool. Making both tools live on the
+same MCP server removes the terminal step (and that confusion) entirely -
+the only local-filesystem operation in the whole workflow is reading the
+lockfile itself, since this server has no access to the caller's machine.
+`condense_lockfile.py` (repo root) still exists as a thin CLI wrapper around
+the same tool, for use outside Cline (scripting, or just checking what
+`scan_repo` would receive) - but Cline is told to always use the MCP tool,
+never this script.
 
-`.clinerules/` tells the model to always do this instead of reading the raw
-lockfile directly. This matters more than it sounds: a raw lockfile is often
-large enough to overflow a small local model's entire context window in one
-message - this project hit that directly (a 176,548-character raw `uv.lock`
-pushed one request to ~135,000 tokens against Qwen2.5-7B-Instruct's real
-32768-token context, and crashed the GPU with a CUDA out-of-memory error
-trying to allocate KV-cache space for it). `serve_mistral.py` now also
-rejects any prompt over `MAX_INPUT_TOKENS` (default 28000, override via env
-var) with a clear HTTP 413 before calling `model.generate()`, so an oversized
-prompt fails cleanly instead of crashing the server - but condensing first is
-what actually avoids hitting that limit on a real dependency tree.
+This matters more than it sounds: a raw lockfile is often large enough to
+overflow a small local model's entire context window in one message - this
+project hit that directly (a 176,548-character raw `uv.lock` pushed one
+request to ~135,000 tokens against Qwen2.5-7B-Instruct's real 32768-token
+context, and crashed the GPU with a CUDA out-of-memory error trying to
+allocate KV-cache space for it). `serve_mistral.py` now also rejects any
+prompt over `MAX_INPUT_TOKENS` (default 28000, override via env var) with a
+clear HTTP 413 before calling `model.generate()`, so an oversized prompt
+fails cleanly instead of crashing the server - but condensing first is what
+actually avoids hitting that limit on a real dependency tree.
 
 ### Using it against a different repo for the first time
 

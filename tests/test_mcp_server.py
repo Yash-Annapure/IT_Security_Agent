@@ -82,6 +82,41 @@ def test_scan_repo_rejects_ellipsis_placeholder_with_clear_error():
         mcp_server.scan_repo(lockfile_content="{ ... (lockfile content) ... }")
 
 
+def test_condense_lockfile_uv_lock_round_trips_to_the_same_components():
+    condensed = mcp_server.condense_lockfile(lockfile_content=UV_LOCK_TEXT)
+    assert condensed == "django==2.2.0"
+    components = mcp_server.parse_lockfile_components(condensed)
+    assert [(c.name, c.version, c.ecosystem) for c in components] == [("django", "2.2.0", "PyPI")]
+
+
+def test_condense_lockfile_package_lock_round_trips_to_the_same_components():
+    condensed = mcp_server.condense_lockfile(lockfile_content=PACKAGE_LOCK_TEXT)
+    original = mcp_server.parse_lockfile_components(PACKAGE_LOCK_TEXT)
+    round_tripped = mcp_server.parse_lockfile_components(condensed)
+    assert {(c.name, c.version, c.ecosystem) for c in round_tripped} == \
+        {(c.name, c.version, c.ecosystem) for c in original}
+
+
+def test_condense_lockfile_is_dramatically_smaller_than_the_original():
+    condensed = mcp_server.condense_lockfile(lockfile_content=UV_LOCK_TEXT)
+    assert len(condensed) < len(UV_LOCK_TEXT)
+
+
+def test_condense_lockfile_requires_lockfile_content():
+    with pytest.raises(ValueError, match="No lockfile content provided"):
+        mcp_server.condense_lockfile()
+
+
+def test_condense_lockfile_raises_clearly_when_nothing_parses():
+    with pytest.raises(ValueError, match="No components could be parsed"):
+        mcp_server.condense_lockfile(lockfile_content='{"packages": {"": {}}}')
+
+
+def test_condense_lockfile_rejects_unexpanded_shell_substitution_with_clear_error():
+    with pytest.raises(ValueError, match="unexpanded shell command substitution"):
+        mcp_server.condense_lockfile(lockfile_content="$(cat uv.lock)")
+
+
 def test_get_connection_caches_across_calls():
     mcp_server._conn = None
     try:
@@ -277,7 +312,7 @@ def test_startup_banner_includes_auto_approve_for_scan_repo():
     expected_config = json.dumps(
         {"mcpServers": {"it-security-agent": {
             "type": "streamableHttp", "url": "http://10.0.0.5:8765/mcp",
-            "timeout": 300, "autoApprove": ["scan_repo"],
+            "timeout": 300, "autoApprove": ["condense_lockfile", "scan_repo"],
         }}},
         indent=2,
     )

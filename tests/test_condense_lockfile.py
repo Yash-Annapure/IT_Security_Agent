@@ -1,51 +1,36 @@
-import json
+import sys
 
 import pytest
 
-from condense_lockfile import condense
-from it_security_agent.mcp_server import parse_lockfile_components
-
-UV_LOCK_TEXT = """
-[[package]]
-name = "django"
-version = "2.2.0"
-source = { registry = "https://pypi.org/simple" }
-
-[[package]]
-name = "our-own-project"
-version = "0.1.0"
-source = { virtual = "." }
-"""
-
-PACKAGE_LOCK_TEXT = json.dumps({
-    "packages": {
-        "": {"name": "root-project"},
-        "node_modules/lodash": {"version": "4.17.15"},
-        "node_modules/express": {"version": "4.18.2"},
-    }
-})
+import condense_lockfile
 
 
-def test_condense_uv_lock_round_trips_to_the_same_components():
-    condensed = condense(UV_LOCK_TEXT)
-    assert condensed == "django==2.2.0"
-    components = parse_lockfile_components(condensed)
-    assert [(c.name, c.version, c.ecosystem) for c in components] == [("django", "2.2.0", "PyPI")]
+def test_main_exits_with_a_clear_error_when_the_file_is_missing(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["condense_lockfile.py", "nonexistent.lock"])
+    with pytest.raises(SystemExit) as exc_info:
+        condense_lockfile.main()
+    assert exc_info.value.code == 1
+    assert "No such file" in capsys.readouterr().err
 
 
-def test_condense_package_lock_round_trips_to_the_same_components():
-    condensed = condense(PACKAGE_LOCK_TEXT)
-    original = parse_lockfile_components(PACKAGE_LOCK_TEXT)
-    round_tripped = parse_lockfile_components(condensed)
-    assert {(c.name, c.version, c.ecosystem) for c in round_tripped} == \
-        {(c.name, c.version, c.ecosystem) for c in original}
+def test_main_reads_the_given_file_and_prints_condensed_output(tmp_path, monkeypatch, capsys):
+    lockfile = tmp_path / "uv.lock"
+    lockfile.write_text(
+        '[[package]]\nname = "django"\nversion = "2.2.0"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+    )
+    monkeypatch.setattr(sys, "argv", ["condense_lockfile.py", str(lockfile)])
+    condense_lockfile.main()
+    assert capsys.readouterr().out.strip() == "django==2.2.0"
 
 
-def test_condense_is_dramatically_smaller_than_the_original():
-    condensed = condense(UV_LOCK_TEXT)
-    assert len(condensed) < len(UV_LOCK_TEXT)
-
-
-def test_condense_raises_clearly_when_nothing_parses():
-    with pytest.raises(ValueError, match="No components parsed"):
-        condense('{"packages": {"": {}}}')
+def test_main_defaults_to_uv_lock_in_the_current_directory(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "uv.lock").write_text(
+        '[[package]]\nname = "flask"\nversion = "3.0.0"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+    )
+    monkeypatch.setattr(sys, "argv", ["condense_lockfile.py"])
+    condense_lockfile.main()
+    assert capsys.readouterr().out.strip() == "flask==3.0.0"

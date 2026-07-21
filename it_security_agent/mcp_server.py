@@ -1,11 +1,14 @@
-"""MCP server exposing this project's vulnerability scanner as one tool: `scan_repo`.
+"""MCP server exposing this project's vulnerability scanner: `scan_repo`, plus
+`condense_lockfile` and `get_setup_rules` in support of it.
 
 Runs over Streamable HTTP so it can be hosted remotely (e.g. alongside a
-self-hosted Mistral-7B-Instruct) and registered as a remote MCP server in
-Cline. Because the server is remote, it has no access to the caller's local
-filesystem - `scan_repo` takes lockfile *content*, not a path. The calling
-agent (Cline) is expected to read the file locally first and pass its text
-through.
+self-hosted local model) and registered as a remote MCP server in Cline.
+Because the server is remote, it has no access to the caller's local
+filesystem - `scan_repo` and `condense_lockfile` both take lockfile
+*content*, not a path. The calling agent (Cline) is expected to read the
+file locally first and pass its text through - `condense_lockfile` exists so
+that's the only local-filesystem step in the whole workflow; everything
+after it is an MCP tool call, never a local script.
 
 Tamper-proof by design: this tool never accepts a pre-made SBOM as input,
 only a lockfile. A caller-supplied SBOM would be an unverified claim about
@@ -23,10 +26,12 @@ import os
 import socket
 import time
 from pathlib import Path
+from typing import Annotated
 
 import requests
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 from it_security_agent import agent, cpe_dictionary, explain, kev, labeling, matching, model, nvd_cache, repo_scan, sbom
 
@@ -59,7 +64,13 @@ mcp = FastMCP(
         "file. If it doesn't, call get_setup_rules once, write its returned text "
         "verbatim to .clinerules/scan-repo.md at that repo's root, then proceed. "
         "This is a one-time per-repo bootstrap - never call get_setup_rules if that "
-        "file already exists, and never repeat this check more than once per repo."
+        "file already exists, and never repeat this check more than once per repo. "
+        "condense_lockfile and scan_repo are both MCP tools only - never scripts, "
+        "modules, or CLI commands; call them the same way you'd call any other tool "
+        "here, never via a terminal. The only local-filesystem step in this whole "
+        "workflow is reading the lockfile itself with your own file tool - everything "
+        "after that is a tool call: condense_lockfile on the raw text, then scan_repo "
+        "on what that returns."
     ),
 )
 
@@ -269,12 +280,95 @@ def get_setup_rules() -> str:
     return CLINERULES_PATH.read_text(encoding="utf-8")
 
 
+def _condense(lockfile_content: str, lockfile_type: str = "") -> str:
+    components = parse_lockfile_components(lockfile_content, lockfile_type)
+    if not components:
+        raise ValueError("No components could be parsed from the provided lockfile - nothing to condense.")
+    if all(c.ecosystem == "npm" for c in components):
+        packages = {f"node_modules/{c.name}": {"version": c.version} for c in components}
+        return json.dumps({"packages": packages})
+    pypi_lines = [f"{c.name}=={c.version}" for c in components if c.ecosystem == "PyPI"]
+    return "\n".join(pypi_lines)
+
+
+@mcp.tool()
+def condense_lockfile(
+    lockfile_content: Annotated[str, Field(description=(
+        "The literal text of a uv.lock, package-lock.json, or requirements.txt file - "
+        "content you already read yourself with your own file tool, pasted in as-is. "
+        "Required. NOT a file path, NOT a shell command, and NOT $(...)/backtick "
+        "substitution syntax - none of that is expanded here, it arrives as literal text "
+        "and the call will fail."
+    ))] = "",
+    lockfile_type: Annotated[str, Field(description=(
+        '"uv.lock", "package-lock.json", or "requirements.txt" - which parser to use. '
+        "Auto-detected from lockfile_content's shape if omitted."
+    ))] = "",
+) -> str:
+    """Condense a raw lockfile to just name==version pairs (or the npm equivalent) -
+    the only thing scan_repo's own parser ever keeps from a lockfile anyway.
+
+    Call this before scan_repo, every time, on every lockfile - then pass what this
+    returns straight into scan_repo's own lockfile_content argument. It round-trips to
+    the exact same components scan_repo would have found from the raw file, just far
+    fewer bytes: wheel/sdist download URLs and integrity hashes make a raw uv.lock or
+    package-lock.json enormous relative to what vulnerability matching actually needs -
+    on a real dependency tree, condensing typically cuts the size by 95%+. That matters
+    directly to you as the calling model: a raw lockfile can be large enough to overflow
+    your own context window in a single message.
+
+    This is an MCP tool, exactly like scan_repo - it is never a script, module, or CLI
+    command. This server has no filesystem access to the caller's machine, same as
+    scan_repo - read the lockfile yourself first, then pass its raw text here.
+
+    Args:
+        lockfile_content: Raw text of a uv.lock, package-lock.json, or requirements.txt
+            file. Required.
+        lockfile_type: "uv.lock", "package-lock.json", or "requirements.txt". Auto-detected
+            if omitted.
+    """
+    if not lockfile_content:
+        raise ValueError(
+            "No lockfile content provided. Read the repo's uv.lock, package-lock.json, or "
+            "requirements.txt yourself first, then call this tool again with its contents as "
+            "lockfile_content."
+        )
+    reason = _placeholder_reason(lockfile_content)
+    if reason is not None:
+        raise ValueError(
+            f"lockfile_content {reason}. Read the repo's actual lockfile with your own "
+            "file tool and pass its real text here instead."
+        )
+    return _condense(lockfile_content, lockfile_type)
+
+
 @mcp.tool()
 def scan_repo(
-    lockfile_content: str = "",
-    lockfile_type: str = "",
-    max_components: int = 40,
-    include_sbom: bool = False,
+    lockfile_content: Annotated[str, Field(description=(
+        "The literal text of a uv.lock, package-lock.json, or requirements.txt file - "
+        "ideally what the condense_lockfile tool returned after you passed it what you "
+        "read yourself with your own file tool, pasted in as-is. Required. NOT a file "
+        "path, NOT a shell command, and NOT $(...)/backtick substitution syntax - none "
+        "of that is expanded here, it arrives as literal text and the call will fail."
+    ))] = "",
+    lockfile_type: Annotated[str, Field(description=(
+        '"uv.lock", "package-lock.json", or "requirements.txt" - which parser to use. '
+        "Auto-detected from lockfile_content's shape if omitted; only set this if "
+        "auto-detection would guess wrong."
+    ))] = "",
+    max_components: Annotated[int, Field(description=(
+        "Cap on how many components to actually run through vulnerability matching "
+        "(keeps one call fast on a large dependency tree). Extra components beyond this "
+        "are silently skipped, not erred on - if include_sbom=True, the generated SBOM "
+        "still covers all of them regardless of this cap."
+    ))] = 40,
+    include_sbom: Annotated[bool, Field(description=(
+        "Whether to include the generated CycloneDX SBOM's full JSON in the response. "
+        "Default False - leave this off for a routine vulnerability check. The SBOM is a "
+        "real bill-of-materials document with one entry per component and can be tens of "
+        "KB on a real dependency tree; only set True when the user specifically asked for "
+        "an SBOM/bill of materials, not just a vulnerability scan."
+    ))] = False,
 ) -> str:
     """Scan a Python/npm dependency list for known vulnerabilities (NVD + CISA KEV + OSV.dev).
 
@@ -285,7 +379,9 @@ def scan_repo(
     scan generates its own CycloneDX SBOM directly from it, every time.
 
     This server has no filesystem access to the caller's machine - read the
-    lockfile yourself first, then pass its raw text here.
+    lockfile yourself first, then pass its raw text here. Call
+    `condense_lockfile` on it first and pass what that returns instead of
+    the raw text directly - same reason, smaller payload, identical result.
 
     First time in this repo? If it has no `.clinerules/scan-repo.md` yet, call
     `get_setup_rules` first and write its output there (see that tool's
@@ -383,7 +479,8 @@ def startup_banner(host: str, port: int) -> str:
         url = f"http://{public_host}:{port}/mcp"
         cline_config = json.dumps(
             {"mcpServers": {"it-security-agent": {
-                "type": "streamableHttp", "url": url, "timeout": 300, "autoApprove": ["scan_repo"],
+                "type": "streamableHttp", "url": url, "timeout": 300,
+                "autoApprove": ["condense_lockfile", "scan_repo"],
             }}},
             indent=2,
         )
@@ -395,10 +492,10 @@ def startup_banner(host: str, port: int) -> str:
             "",
             cline_config,
             "",
-            "\"autoApprove\": [\"scan_repo\"] skips Cline's per-call confirmation prompt for",
-            "this tool - safe to leave in, since scan_repo never writes to or executes",
-            "anything on the caller's machine. Remove it from the list if you'd rather",
-            "approve each scan by hand.",
+            "\"autoApprove\": [\"condense_lockfile\", \"scan_repo\"] skips Cline's per-call",
+            "confirmation prompt for both tools - safe to leave in, since neither writes to",
+            "or executes anything on the caller's machine. Remove either name from the list",
+            "if you'd rather approve those calls by hand.",
             "",
             "No built-in auth - only expose this on a private/trusted network.",
         ]

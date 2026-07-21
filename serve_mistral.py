@@ -125,6 +125,18 @@ print("Model loaded.", flush=True)
 app = FastAPI()
 
 
+@app.exception_handler(HTTPException)
+async def openai_style_http_exception_handler(request: Request, exc: HTTPException):
+    # FastAPI's default HTTPException body is {"detail": "..."} - OpenAI-compatible
+    # clients (Cline included) expect {"error": {"message": ...}} and otherwise show
+    # a bare "413 status code (no body)" with the actual reason nowhere in sight. This
+    # is what makes the MAX_INPUT_TOKENS guard's message actually reach the caller.
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": {"message": exc.detail, "type": "invalid_request_error", "code": None}},
+    )
+
+
 @app.middleware("http")
 async def normalize_path(request: Request, call_next):
     # Some OpenAI-compatible clients build the request path by string-joining a

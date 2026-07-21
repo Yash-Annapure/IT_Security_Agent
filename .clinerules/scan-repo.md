@@ -1,28 +1,45 @@
 # Vulnerability scanning in this repo
 
-An MCP tool called `scan_repo` is available (server: `it-security-agent`). It
-checks this repo's dependencies against NVD, CISA KEV, and OSV.dev, and
-returns a triaged findings report. You may be running as a small (~7B) local
-model - follow these steps literally, in order, every time.
+Three MCP tools are available on the `it-security-agent` server:
+`condense_lockfile`, `scan_repo`, and `get_setup_rules`. Together they check
+this repo's dependencies against NVD, CISA KEV, and OSV.dev, and return a
+triaged findings report. You may be running as a small (~7B) local model -
+follow these steps literally, in order, every time.
 
-## `scan_repo` is an MCP tool, not a script - never run it from a terminal
+## `condense_lockfile` and `scan_repo` are MCP tools, not scripts - never run them from a terminal
 
-There is no `scan_repo.py`, no `scan_repo` executable, and no CLI wrapper
-anywhere in this repo, under any name. `scan_repo` and `get_setup_rules`
-exist *only* as tools on the `it-security-agent` MCP server - call them
-through your MCP tool-use mechanism, the same way you'd call any other MCP
-tool, never via `python scan_repo.py`, `uv run scan_repo.py`,
-`it-security-agent scan_repo`, or any other shell/terminal command.
+`condense_lockfile`, `scan_repo`, and `get_setup_rules` exist *only* as
+tools on the `it-security-agent` MCP server - call them through your MCP
+tool-use mechanism, the same way you'd call any other MCP tool, never via
+`python scan_repo.py`, `python -m it_security_agent.scan_repo`,
+`uv run scan_repo.py`, `it-security-agent scan_repo`, or any other
+shell/terminal command. **There is nothing to run in a terminal anywhere in
+this workflow** - the only local-filesystem step is reading the lockfile
+itself with your own file tool; everything after that is a tool call.
 
-`condense_lockfile.py` (repo root) is the *only* real, runnable script in
-this workflow - don't assume `scan_repo` works the same way just because
-that one does; they are not the same kind of thing. If a command referencing
-`scan_repo` fails with "No such file or directory" or similar, that is not a
-sign the file is missing from some other location - it means you tried to
-run an MCP tool as a shell command by mistake. Don't ask the user where the
-file is; there is no file, anywhere, to find. Recognize the mistake yourself
-and call `scan_repo` as an MCP tool instead, in the same turn, without
-asking - you already have everything you need to do that correctly.
+This has been tried more than once in practice, so `scan_repo.py` (repo
+root) and `it_security_agent/scan_repo.py` do exist as files now - but only
+as deliberate redirect stubs that immediately print an error and exit if you
+run them. They are not the real tool and never will work as a script; seeing
+them in a file listing is not a sign you should try running one, it's the
+opposite signal. `condense_lockfile.py` (repo root) is a real, runnable
+script, but it's a convenience for use *outside* Cline (scripting, checking
+what `scan_repo` would receive) - inside Cline, always use the
+`condense_lockfile` MCP tool, not this script.
+
+If a command referencing `scan_repo` or `condense_lockfile` fails with "No
+such file or directory," "No module named," or similar, that is not a sign
+the file/module is missing from some other location or that a package needs
+installing - it means you tried to run an MCP tool as a shell command by
+mistake. Don't ask the user where the file is; there is no file, anywhere,
+to find. **Do not run `pip install`, `pip install -e .`, `uv sync`,
+`uv add`, or any other install command to try to "make it available"** -
+that has been tried in practice, does nothing to fix this, and risks
+installing this project's entire dependency tree into the wrong Python
+environment if your terminal isn't using this project's own `.venv`.
+Recognize the mistake yourself and call the tool through your MCP mechanism
+instead, in the same turn, without asking, without installing anything - you
+already have access to it right now, no setup required.
 
 ## When to use it
 
@@ -42,56 +59,47 @@ re-explaining. If you are in Cline's Plan mode, you cannot call tools at all;
 say so plainly and ask the user to switch to Act mode rather than silently
 re-describing the plan on every reply.
 
-## How to call it (do these two steps in order)
+## How to call it (do these three steps in order)
 
 1. Find the repo's actual lockfile at **the root of the project you were
    asked to scan** (not your currently open editor tab, not a file mentioned
    earlier in this conversation for some other reason) - in this order of
    preference: `uv.lock` (or any other `*.lock`), `package-lock.json`,
-   `requirements.txt`.
-2. Run `condense_lockfile.py <that file>` **with your terminal tool** (e.g.
-   `uv run condense_lockfile.py uv.lock`, or `python condense_lockfile.py
-   package-lock.json`) - this is the one step in this workflow that's a
-   terminal command. Then invoke the `scan_repo` **MCP tool** (not a
-   terminal command - use your MCP tool-call mechanism) with
-   `lockfile_content` set to exactly what that command printed to stdout.
+   `requirements.txt`. Read it with your own file tool. This is the *only*
+   local-filesystem step in the whole workflow.
+2. Call the `condense_lockfile` **MCP tool** with `lockfile_content` set to
+   the literal text you just read in step 1. Use exactly what it returns -
+   don't re-type, reformat, or summarize it.
+3. Call the `scan_repo` **MCP tool** with `lockfile_content` set to exactly
+   what `condense_lockfile` returned in step 2.
 
-   **If you redirected that command's output to a file** (e.g.
-   `... > reports/condensed_lockfile.txt`) instead of using its printed
-   output directly, you now have to **read that file with your own
-   file-read tool** and use the text it returns as `lockfile_content` -
-   the exact same rule as for the original lockfile in step 1. Do **not**
-   pass the file's path, a `cat`/`type` command, or any `$(...)`/backtick
-   substitution as the value instead of the file's actual contents - none
-   of those get expanded by the MCP tool, they arrive as literal text and
-   the call will fail. If you already have the printed output in hand from
-   running the command, prefer using that directly and skip writing it to
-   a file at all.
-
-**Always condense first - never `type`/`cat` the raw lockfile into the
-conversation, and never pass the raw file's content directly.** Raw lockfiles
+Steps 2 and 3 are both MCP tool calls, through your MCP tool-use mechanism -
+never a terminal command, never `python`, never `uv run`. **Always condense
+first - never pass the raw lockfile's content to `scan_repo` directly, and
+never `type`/`cat` the raw lockfile into the conversation.** Raw lockfiles
 are mostly per-platform wheel/sdist download URLs and hashes that
 `scan_repo`'s own parser throws away anyway; on a real dependency tree that
 noise is large enough to overflow your entire context window in a single
 message - this project hit exactly that (one raw lockfile crashed the model
-server with an out-of-memory error). `condense_lockfile.py` strips that noise
+server with an out-of-memory error). `condense_lockfile` strips that noise
 to just name/version pairs using the same parser `scan_repo` uses
 server-side, so the scan result is identical either way - condensing loses
 nothing that matters to vulnerability matching, only bytes it never needed.
 
-Before calling the tool, sanity-check your own `lockfile_content` value: does
-it contain actual package names and version numbers? If it looks like a
-description, a filename, angle brackets, an ellipsis, or **literal shell
-syntax you expected to be expanded** (e.g. `$(type uv.lock)`, backticks,
-`%VAR%`) - MCP tool arguments are never run through a shell, nothing expands
-that for you - you have not actually run the condense command yet. Go run it
-for real and use the text it printed, not a description of what it would
-print.
+Before calling either tool, sanity-check your own `lockfile_content` value:
+does it contain actual package names and version numbers (or, for step 3,
+exactly what `condense_lockfile` returned)? If it looks like a description,
+a filename, angle brackets, an ellipsis, or **literal shell syntax you
+expected to be expanded** (e.g. `$(cat uv.lock)`, backticks, `%VAR%`) - MCP
+tool arguments are never run through a shell, nothing expands that for you -
+you have not actually read the file (or called `condense_lockfile`) yet. Go
+do that for real and use the text you got back, not a description of what it
+would contain.
 
-If `scan_repo` returns an error, read what it says - the error explains what
-was wrong with what you sent. Do not retry the exact same call unchanged; it
-will fail the exact same way every time. Fix what the error describes, then
-call it again.
+If `condense_lockfile` or `scan_repo` returns an error, read what it says -
+the error explains what was wrong with what you sent. Do not retry the exact
+same call unchanged; it will fail the exact same way every time. Fix what
+the error describes, then call it again.
 
 If you can't find a lockfile at the project root, say so and ask the user
 where their dependency file lives - do not guess or invent one, and do not
