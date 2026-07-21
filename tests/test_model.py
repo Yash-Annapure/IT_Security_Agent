@@ -60,3 +60,33 @@ def test_predict_confidence_returns_probability(tmp_path):
     signals = {f: 0.5 for f in labeling.FEATURES}
     confidence = model.predict_confidence(loaded_model, signals)
     assert 0.0 <= confidence <= 1.0
+
+
+def test_predict_confidence_batch_matches_scoring_one_at_a_time(tmp_path):
+    # The agent scores a component's whole candidate list in one call for speed; that
+    # must be a pure optimisation, not a change in what any single candidate scores.
+    df = _synthetic_dataset()
+    model.train_and_compare(df, model_dir=tmp_path)
+    _, loaded_model, _ = model.load_winning_model(model_dir=tmp_path)
+    rows = df[labeling.FEATURES].head(12).to_dict("records")
+    assert model.predict_confidence_batch(loaded_model, rows) == pytest.approx(
+        [model.predict_confidence(loaded_model, r) for r in rows])
+
+
+def test_predict_confidence_batch_on_empty_list_returns_empty(tmp_path):
+    df = _synthetic_dataset()
+    model.train_and_compare(df, model_dir=tmp_path)
+    _, loaded_model, _ = model.load_winning_model(model_dir=tmp_path)
+    assert model.predict_confidence_batch(loaded_model, []) == []
+
+
+def test_predict_confidence_batch_ignores_extra_signal_keys(tmp_path):
+    # Candidates carry normalize's 6-key signals dict, which includes registry_overlap -
+    # the training *label*. It must never reach the model as a feature.
+    df = _synthetic_dataset()
+    model.train_and_compare(df, model_dir=tmp_path)
+    _, loaded_model, _ = model.load_winning_model(model_dir=tmp_path)
+    clean = {f: 0.5 for f in labeling.FEATURES}
+    polluted = {**clean, "registry_overlap": True, "unrelated": 99}
+    assert model.predict_confidence_batch(loaded_model, [polluted]) == pytest.approx(
+        model.predict_confidence_batch(loaded_model, [clean]))

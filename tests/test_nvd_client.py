@@ -93,7 +93,16 @@ def test_fetch_all_pages_parallel_streams_progress_monotonically():
         on_page=lambda v, f, t: seen.append((f, t)),
     )
     assert vulns == []  # streaming mode still accumulates nothing
-    assert [f for f, _ in seen] == [2, 4, 6, 7]  # running total, never exceeding total
+    fetched = [f for f, _ in seen]
+    # Pages are fetched concurrently and land out of order (see the test above), so the
+    # *intermediate* running totals depend on which worker finishes first - asserting an
+    # exact sequence here made this test fail roughly half the time. What the counter
+    # actually promises is that it only ever moves forward, never overshoots the total,
+    # and ends exactly on it.
+    assert len(fetched) == 4  # one callback per page: 2 + 2 + 2 + 1
+    assert fetched == sorted(fetched)
+    assert fetched[-1] == 7
+    assert all(0 < f <= 7 for f in fetched)
     assert {t for _, t in seen} == {7}
 
 

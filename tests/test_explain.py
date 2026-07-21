@@ -32,3 +32,21 @@ def test_explain_match_returns_dict_keyed_by_feature():
     row = X.iloc[[0]]
     result = explain.explain_match(explainer, row)
     assert set(result.keys()) == set(labeling.FEATURES)
+
+
+def test_explain_matches_batches_without_changing_per_row_values():
+    # The agent explains a whole review queue in one call; each row must get exactly the
+    # contributions it would have got explained on its own.
+    rf = RandomForestClassifier(n_estimators=10, random_state=0).fit(X, y)
+    explainer = explain.make_explainer("random_forest", rf, X)
+    rows = X.iloc[:5]
+    batched = explain.explain_matches(explainer, rows)
+    assert len(batched) == 5
+    for i, contributions in enumerate(batched):
+        assert contributions == pytest.approx(explain.explain_match(explainer, X.iloc[[i]]))
+
+
+def test_explain_matches_on_empty_frame_returns_empty():
+    rf = RandomForestClassifier(n_estimators=10).fit(X, y)
+    explainer = explain.make_explainer("random_forest", rf, X)
+    assert explain.explain_matches(explainer, X.iloc[:0]) == []

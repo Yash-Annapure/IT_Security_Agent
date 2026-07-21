@@ -96,6 +96,38 @@ def get_connection():
     return _conn
 
 
+# NVD's published catalog size, for reporting how much of it this cache actually holds.
+# Only ever used to contextualise a result - never to gate a scan.
+NVD_CATALOG_SIZE = 368_000
+# Below this, "no vulnerabilities found" says more about the cache than about the code.
+THIN_CACHE_FRACTION = 0.9
+
+
+def _cache_coverage(conn):
+    """How much of NVD this cache holds, so a clean result can be read in context.
+
+    Matching can only find CVEs that are cached. A partial sync therefore produces a
+    reassuringly empty report rather than an error, which is the most dangerous way for
+    this tool to be wrong - so every report states its own coverage. Returns None when
+    the cache can't be read at all: a report with no coverage claim is honest, a report
+    claiming zero coverage would not be.
+    """
+    try:
+        cves = conn.execute("SELECT COUNT(*) FROM cves").fetchone()[0]
+    except Exception:
+        return None
+    try:
+        kev_count = conn.execute("SELECT COUNT(*) FROM kev").fetchone()[0]
+    except Exception:
+        kev_count = 0  # KEV table is created on first refresh; absent just means none yet
+    return {
+        "cves": cves,
+        "kev": kev_count,
+        "fraction": cves / NVD_CATALOG_SIZE,
+        "thin": cves / NVD_CATALOG_SIZE < THIN_CACHE_FRACTION,
+    }
+
+
 def _ensure_synced(conn):
     global _last_synced
     if time.time() - _last_synced < SYNC_INTERVAL_SECONDS:
@@ -218,7 +250,7 @@ def prewarm(components, conn, budget_seconds=PREWARM_BUDGET_SECONDS, step=None):
         time.sleep(REQUEST_SPACING_SECONDS)
 
 
-def run_pipeline(components, conn, step=None):
+def run_pipeline(components, conn, step=None, meta=None):
     """Train on this scan's own components and triage them, exactly like week3_agent.ipynb.
 
     Returns None if there isn't enough labeled signal to train (e.g. too few
@@ -240,6 +272,9 @@ def run_pipeline(components, conn, step=None):
     model.train_and_compare(dataset, model_dir=MODEL_DIR)
     winner_name, winning_model, threshold = model.load_winning_model(model_dir=MODEL_DIR)
     report(f"Winning model: {winner_name} (decision threshold {threshold:.2f})")
+    if meta is not None:
+        meta["model"] = {"name": winner_name, "threshold": threshold,
+                         "training_rows": len(dataset), "features": len(labeling.FEATURES)}
     background = dataset[labeling.FEATURES].astype(float)
     explainer = explain.make_explainer(winner_name, winning_model, background)
     report("Built SHAP explainer - scoring every match and applying the triage policy...")
@@ -260,11 +295,101 @@ def raw_matches(components, conn):
     return found
 
 
+def _coverage_caveat(meta: dict, found_anything: bool) -> list:
+    """State how much of NVD was actually searched, and what that does to the result.
+
+    Matching can only find CVEs that are cached, so an incomplete sync produces a
+    reassuringly empty report rather than an error - the most dangerous way for this
+    tool to be wrong. Every report therefore carries its own coverage, and an empty
+    result on a thin cache is explicitly denied the reading "your code is clean".
+    """
+    cache = meta.get("cache")
+    if not cache:
+        return []
+    lines = ["", f"_Searched a local NVD cache of {cache['cves']:,} CVEs "
+                 f"(~{cache['fraction']:.0%} of NVD's ~{NVD_CATALOG_SIZE:,}) "
+                 f"and {cache['kev']:,} CISA known-exploited entries._"]
+    if not cache["thin"]:
+        return lines
+    if found_anything:
+        lines += ["", "> **Coverage caveat:** the local cache is incomplete, so this list "
+                      "is a lower bound - there may be further vulnerabilities whose CVEs "
+                      "simply aren't cached yet."]
+    else:
+        lines += [
+            "",
+            "> **This is not a clean bill of health.** Matching can only find CVEs that "
+            f"are in the local cache, and this cache holds ~{cache['fraction']:.0%} of "
+            "NVD's catalog. A component can only be reported as vulnerable if its CVE "
+            "was synced, so this result reflects cache coverage as much as code health. "
+            "Run `uv run warm_cache.py --full` to completion before treating an empty "
+            "result as meaningful.",
+        ]
+    return lines
+
+
+def _verdict(result, meta: dict) -> list:
+    """The headline answer - were vulnerabilities found, yes or no - stated first.
+
+    A reader should never have to count section headings to find that out, and should
+    never read "none found" without also seeing how much of NVD was actually searched.
+    """
+    actionable = len(result.escalated) + len(result.confirmed)
+    needs_review = len(result.review_queue)
+
+    if actionable:
+        headline = (f"**VULNERABILITIES FOUND: {actionable}** "
+                    f"({len(result.escalated)} actively exploited, {len(result.confirmed)} confirmed)"
+                    + (f", plus {needs_review} needing human review." if needs_review else "."))
+    elif needs_review:
+        headline = (f"**NO CONFIRMED VULNERABILITIES**, but {needs_review} candidate "
+                    f"match{'es' if needs_review > 1 else ''} need human review.")
+    else:
+        headline = "**NO VULNERABILITIES FOUND** in the scanned components."
+
+    return ["", headline] + _coverage_caveat(meta, bool(actionable))
+
+
+def _flagging_policy(meta: dict) -> list:
+    """Explain how every match got into the bucket it's in.
+
+    The buckets are a policy decision, not a model output: the model only ever produces
+    a probability, and the risk weighting (a missed vulnerability costs 10x a false
+    alarm) is what turns that into a routing decision. Stating it in the report keeps
+    the reader from reading "confirmed" as certainty or "rejected" as absence.
+    """
+    m = meta.get("model")
+    lines = ["", "## How these were flagged", ""]
+    if m:
+        lines.append(
+            f"A `{m['name']}` classifier was trained on this scan's own {m['training_rows']:,} "
+            f"candidate matches across {m['features']} features, scored with the risk weighting "
+            f"that counts a missed vulnerability as {model.FN_WEIGHT}x as costly as a false "
+            f"alarm, giving a decision threshold of **{m['threshold']:.2f}**.")
+        lines.append("")
+    lines += [
+        "Every candidate match lands in exactly one bucket:",
+        "",
+        "- **escalated** - matched, and the CVE is on CISA's Known Exploited Vulnerabilities "
+        "list. Actively exploited in the wild; fix first.",
+        "- **confirmed** - the model's confidence cleared the threshold, *or* OSV.dev "
+        "independently reports a vulnerability for this exact package version.",
+        "- **review_queue** - matched, but confidence fell below the threshold and OSV "
+        "didn't corroborate. Kept for a human, with SHAP values showing which signals "
+        "pushed the score up or down. These are not dismissed - they are undecided.",
+        "- **rejected** - the package *name* matched a CVE but the pinned version isn't in "
+        "the affected range, or no plausible vendor matched. This is the name-collision "
+        "case (e.g. PyPI `babel` vs Babel.js).",
+    ]
+    return lines
+
+
 def format_summary(result, meta: dict) -> str:
     lines = ["# Vulnerability scan result"]
     if meta["truncated"]:
         lines.append(f"_Scanned {meta['scanned']} of {meta['total']} components "
                       f"(capped by max_components={meta['max_components']})._")
+    lines += _verdict(result, meta)
     lines += [
         "",
         f"- **escalated** (actively exploited - CISA KEV): {len(result.escalated)}",
@@ -272,6 +397,7 @@ def format_summary(result, meta: dict) -> str:
         f"- **review_queue** (model wasn't confident - needs a human): {len(result.review_queue)}",
         f"- rejected (name matched, ruled out by version or vendor): {len(result.rejected)}",
     ]
+    lines += _flagging_policy(meta)
 
     if result.escalated:
         lines += ["", "## Escalated - fix these first",
@@ -289,8 +415,6 @@ def format_summary(result, meta: dict) -> str:
                   "should look. The 'why the model hesitated' factors are SHAP values: how "
                   "much each signal pushed the score up (+) or down (-)._"]
         lines += [_detail_block(f) for f in result.review_queue]
-    if not (result.escalated or result.confirmed or result.review_queue):
-        lines += ["", "No vulnerabilities found in the scanned components."]
     return "\n".join(lines)
 
 
@@ -388,6 +512,9 @@ def format_raw_matches(found: list, meta: dict) -> str:
     if meta["truncated"]:
         lines.append(f"_Scanned {meta['scanned']} of {meta['total']} components "
                       f"(capped by max_components={meta['max_components']})._")
+    # The untriaged fallback can report an empty result for exactly the same reason the
+    # triaged path can - an incomplete cache - so it carries the same caveat.
+    lines += _coverage_caveat(meta, bool(found))
     if not found:
         lines.append("\nNo name+version matches found in the scanned components.")
         return "\n".join(lines)
@@ -729,10 +856,20 @@ def _run_scan(lockfile_content: str, lockfile_type: str = "", max_components: in
         _ensure_synced(conn)
         step("NVD + KEV sync complete")
 
+    coverage = _cache_coverage(conn)
+    if coverage is not None:
+        meta["cache"] = coverage
+        step(f"Local NVD cache holds {coverage['cves']:,} CVEs "
+             f"(~{coverage['fraction']:.0%} of NVD's ~{NVD_CATALOG_SIZE:,}) "
+             f"+ {coverage['kev']:,} known-exploited")
+        if coverage["thin"]:
+            step("WARNING: cache coverage is incomplete - matching can only find CVEs that "
+                 "are cached, so a clean result here is not proof the code is clean")
+
     prewarm(components, conn, step=step)
 
     step("Matching components against NVD (name + version + vendor), cross-checking OSV.dev...")
-    result = run_pipeline(components, conn, step=step)
+    result = run_pipeline(components, conn, step=step, meta=meta)
     if result is None:
         step("Not enough labeled signal to train a confidence model - falling back to untriaged raw matches")
         text = format_raw_matches(raw_matches(components, conn), meta)

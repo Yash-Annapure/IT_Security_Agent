@@ -586,6 +586,75 @@ def _finding(cve="CVE-2024-0001", confidence=0.9, explanation=None):
                     confidence=confidence, corroboration="osv_disagrees", explanation=explanation)
 
 
+FULL_CACHE = {"cves": 365_000, "kev": 1_600, "fraction": 0.99, "thin": False}
+THIN_CACHE = {"cves": 42_055, "kev": 1_600, "fraction": 0.11, "thin": True}
+
+
+def _meta(cache=None, **over):
+    meta = {"scanned": 1, "total": 1, "truncated": False, "max_components": 40}
+    if cache is not None:
+        meta["cache"] = cache
+    return {**meta, **over}
+
+
+def test_format_summary_leads_with_a_yes_or_no_verdict():
+    found = mcp_server.format_summary(ScanResult(confirmed=[_finding()]), _meta(FULL_CACHE))
+    assert "VULNERABILITIES FOUND: 1" in found
+
+    clean = mcp_server.format_summary(ScanResult(), _meta(FULL_CACHE))
+    assert "NO VULNERABILITIES FOUND" in clean
+
+
+def test_format_summary_distinguishes_clean_from_undecided():
+    # "nothing confirmed" and "nothing found" are different answers - a review queue
+    # means the scan reached no conclusion, not that the components are clean.
+    text = mcp_server.format_summary(ScanResult(review_queue=[_finding()]), _meta(FULL_CACHE))
+    assert "NO CONFIRMED VULNERABILITIES" in text
+    assert "need human review" in text
+    assert "NO VULNERABILITIES FOUND" not in text
+
+
+def test_clean_result_on_a_thin_cache_is_not_reported_as_clean():
+    # The dangerous failure mode: a partial NVD sync produces an empty report rather
+    # than an error. The report must say so instead of implying a clean bill of health.
+    text = mcp_server.format_summary(ScanResult(), _meta(THIN_CACHE))
+    assert "not a clean bill of health" in text
+    assert "11%" in text
+    assert "warm_cache.py --full" in text
+
+
+def test_clean_result_on_a_full_cache_carries_no_coverage_warning():
+    text = mcp_server.format_summary(ScanResult(), _meta(FULL_CACHE))
+    assert "not a clean bill of health" not in text
+    assert "365,000 CVEs" in text
+
+
+def test_findings_on_a_thin_cache_are_marked_a_lower_bound():
+    text = mcp_server.format_summary(ScanResult(confirmed=[_finding()]), _meta(THIN_CACHE))
+    assert "lower bound" in text
+    assert "not a clean bill of health" not in text  # findings exist; the caveat differs
+
+
+def test_format_summary_states_the_flagging_policy():
+    text = mcp_server.format_summary(ScanResult(confirmed=[_finding()]), _meta(
+        FULL_CACHE, model={"name": "random_forest", "threshold": 0.15,
+                           "training_rows": 26856, "features": 7}))
+    assert "## How these were flagged" in text
+    assert "random_forest" in text and "0.15" in text
+    assert "26,856" in text
+    assert f"{mcp_server.model.FN_WEIGHT}x as costly" in text
+    for bucket in ("escalated", "confirmed", "review_queue", "rejected"):
+        assert f"**{bucket}**" in text
+
+
+def test_format_summary_without_cache_metadata_makes_no_coverage_claim():
+    # Callers that don't supply coverage (older callers, tests) must get a report that
+    # simply omits the claim rather than one that implies full coverage.
+    text = mcp_server.format_summary(ScanResult(), _meta())
+    assert "Searched a local NVD cache" not in text
+    assert "NO VULNERABILITIES FOUND" in text
+
+
 def test_format_summary_includes_escalated_and_review_queue_sections():
     result = ScanResult(
         escalated=[_finding(cve="CVE-ESCALATED")],
@@ -654,7 +723,11 @@ def test_format_summary_truncates_very_long_nvd_descriptions():
         "scanned": 1, "total": 1, "truncated": False, "max_components": 40,
     })
     assert "truncated - see the NVD link" in text
-    assert len(text) < 2000  # the 2000-char description didn't land whole
+    # Assert against the description itself rather than the report's total length: the
+    # report carries fixed explanatory sections (verdict, flagging policy) whose size is
+    # unrelated to whether this field was cut.
+    assert "x" * 900 in text
+    assert "x" * 901 not in text
 
 
 def test_format_summary_notes_truncation():
@@ -671,3 +744,11 @@ def test_format_raw_matches_warns_it_is_untriaged():
     text = mcp_server.format_raw_matches(found, meta)
     assert "Not enough labeled data" in text
     assert "CVE-X" in text
+
+
+def test_format_raw_matches_empty_on_a_thin_cache_is_not_reported_as_clean():
+    # The untriaged fallback reports emptiness for the same reason the triaged path can -
+    # an incomplete cache - so it must carry the same caveat rather than reading clean.
+    text = mcp_server.format_raw_matches([], _meta(THIN_CACHE))
+    assert "not a clean bill of health" in text
+    assert "No name+version matches found" in text

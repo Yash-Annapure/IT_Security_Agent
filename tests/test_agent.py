@@ -13,11 +13,14 @@ def _match(cve="CVE-2024-0001", vendor_candidate=None):
 
 
 def _run_scan(component, matches, rejected, osv_vulns, kev_entry, confidence):
+    kev_ids = {m["cve"] for m in matches} if kev_entry else set()
     with patch("it_security_agent.matching.find_candidates", return_value=(matches, rejected)), \
          patch("it_security_agent.osv.query", return_value=osv_vulns), \
-         patch("it_security_agent.kev.is_kev", return_value=kev_entry), \
-         patch("it_security_agent.model.predict_confidence", return_value=confidence), \
-         patch("it_security_agent.explain.explain_match", return_value={"name_similarity": 0.1}):
+         patch("it_security_agent.kev.load_kev_ids", return_value=kev_ids), \
+         patch("it_security_agent.model.predict_confidence_batch",
+               side_effect=lambda m, rows: [confidence] * len(rows)), \
+         patch("it_security_agent.explain.explain_matches",
+               side_effect=lambda e, rows: [{"name_similarity": 0.1}] * len(rows)):
         return agent.scan([component], "random_forest", MagicMock(), 0.7, MagicMock())
 
 
@@ -80,6 +83,52 @@ def test_rejected_findings_are_kept_not_dropped():
     assert result.rejected[0].cve == "CVE-2024-0002"
 
 
+def test_osv_is_queried_once_per_component_not_once_per_match():
+    # OSV is keyed on (ecosystem, name, version) - the component - so every candidate CVE
+    # for a component shares one answer. Querying per match meant a component whose OSV
+    # entry wasn't cached yet made one network round trip per candidate.
+    component = Component(name="django", version="2.2.0", ecosystem="PyPI", source="test")
+    candidate = VendorCandidate(vendor="djangoproject", product="django", signals={})
+    matches = [_match(cve=f"CVE-2024-000{i}", vendor_candidate=candidate) for i in range(5)]
+    with patch("it_security_agent.matching.find_candidates", return_value=(matches, [])), \
+         patch("it_security_agent.osv.query", return_value=[]) as osv_query, \
+         patch("it_security_agent.kev.load_kev_ids", return_value=set()), \
+         patch("it_security_agent.model.predict_confidence_batch",
+               side_effect=lambda m, rows: [0.9] * len(rows)):
+        agent.scan([component], "random_forest", MagicMock(), 0.7, MagicMock())
+    assert osv_query.call_count == 1
+
+
+def test_kev_catalog_is_read_once_per_scan_not_once_per_finding():
+    components = [Component(name=f"pkg{i}", version="1.0", ecosystem="PyPI", source="test") for i in range(4)]
+    candidate = VendorCandidate(vendor="v", product="p", signals={})
+    with patch("it_security_agent.matching.find_candidates",
+               return_value=([_match(vendor_candidate=candidate)], [])), \
+         patch("it_security_agent.osv.query", return_value=[]), \
+         patch("it_security_agent.kev.load_kev_ids", return_value=set()) as load_kev, \
+         patch("it_security_agent.kev.is_kev") as is_kev, \
+         patch("it_security_agent.model.predict_confidence_batch",
+               side_effect=lambda m, rows: [0.9] * len(rows)):
+        agent.scan(components, "random_forest", MagicMock(), 0.7, MagicMock())
+    assert load_kev.call_count == 1
+    assert is_kev.call_count == 0  # the preloaded set replaces per-CVE lookups entirely
+
+
+def test_triage_component_still_works_standalone_without_a_preloaded_kev_set():
+    # The notebook triages single components directly; that path must keep working and
+    # must still detect KEV membership, falling back to per-CVE lookups.
+    component = Component(name="django", version="2.2.0", ecosystem="PyPI", source="test")
+    candidate = VendorCandidate(vendor="djangoproject", product="django", signals={})
+    with patch("it_security_agent.matching.find_candidates",
+               return_value=([_match(vendor_candidate=candidate)], [])), \
+         patch("it_security_agent.osv.query", return_value=[]), \
+         patch("it_security_agent.kev.is_kev", return_value={"dueDate": "2024-01-01"}), \
+         patch("it_security_agent.model.predict_confidence_batch", side_effect=lambda m, rows: [0.9]):
+        result = agent.triage_component(component, "random_forest", MagicMock(), 0.7, MagicMock())
+    assert len(result.escalated) == 1
+    assert result.escalated[0].kev_hit is True
+
+
 def test_review_queue_uses_real_explainer_over_labeling_features():
     # Regression guard: the review-queue branch must feed predict_confidence and
     # explain_match a vector matching labeling.FEATURES exactly (no registry_overlap
@@ -100,7 +149,7 @@ def test_review_queue_uses_real_explainer_over_labeling_features():
     # osv_vulns=[] -> osv_disagrees, and threshold above any probability -> review queue.
     with patch("it_security_agent.matching.find_candidates", return_value=([_match(vendor_candidate=candidate)], [])), \
          patch("it_security_agent.osv.query", return_value=[]), \
-         patch("it_security_agent.kev.is_kev", return_value=None):
+         patch("it_security_agent.kev.load_kev_ids", return_value=set()):
         result = agent.scan([component], "random_forest", rf, 2.0, real_explainer)
 
     assert len(result.review_queue) == 1

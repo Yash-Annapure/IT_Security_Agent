@@ -60,7 +60,8 @@ def _fmt_duration(seconds: float) -> str:
 def _db_stats(conn) -> dict:
     """Row counts per table, tolerating tables that don't exist yet on a fresh DB."""
     stats = {}
-    for table in ("cves", "kev", "cpe_dictionary"):
+
+    for table in ("cves", "kev", "cpe_dictionary", "cve_products"):
         try:
             stats[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         except Exception:
@@ -74,7 +75,18 @@ def _db_stats(conn) -> dict:
 
 def _print_stats(label: str, stats: dict) -> None:
     print(f"  {label}: {stats['cves']:,} CVEs, {stats['kev']:,} known-exploited, "
-          f"{stats['cpe_dictionary']:,} CPE names ({stats['size_mb']:.1f} MB)", flush=True)
+          f"{stats['cpe_dictionary']:,} CPE names, {stats['cve_products']:,} indexed "
+          f"CPE products ({stats['size_mb']:.1f} MB)", flush=True)
+
+
+def _coverage_line(stats: dict) -> str:
+    """Say plainly how much of NVD is cached - the setting that decides whether a scan
+    can find anything at all. An interrupted sync otherwise looks like a clean scan."""
+    fraction = stats["cves"] / 368_000
+    verdict = ("matching is effectively blind - scans will look clean because most CVEs "
+               "simply aren't here" if fraction < 0.5 else
+               "usable, but still incomplete" if fraction < 0.9 else "good")
+    return f"  Coverage: ~{fraction:.0%} of NVD's ~368,000 CVEs - {verdict}."
 
 
 def _collect_names(paths: list[Path]) -> list[str]:
@@ -175,10 +187,13 @@ def main():
         sys.exit(1)
 
     started = time.time()
-    conn = nvd_cache.get_connection()
     print(f"Cache database: {nvd_cache.DB_PATH}", flush=True)
+    print("  (opening - a cache built before the CPE product index will be backfilled now)",
+          flush=True)
+    conn = nvd_cache.get_connection()
     before = _db_stats(conn)
     _print_stats("before", before)
+    print(_coverage_line(before), flush=True)
 
     print("\nReading lockfiles:", flush=True)
     names = _collect_names(paths)
@@ -222,6 +237,7 @@ def main():
     print(f"\nCache warm in {_fmt_duration(time.time() - started)}.", flush=True)
     _print_stats("before", before)
     _print_stats(" after", after)
+    print(_coverage_line(after), flush=True)
     if failed:
         print(f"  {failed} CPE lookup(s) failed - those names just yield fewer vendor "
               f"candidates when matching. Re-run to retry them.", flush=True)
