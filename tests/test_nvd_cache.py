@@ -144,6 +144,62 @@ def test_interrupted_backfill_is_not_recorded_as_complete(tmp_path):
     assert len(nvd_cache.query_by_product_name("pkg7", conn=conn)) == 1
 
 
+def test_cache_is_opened_in_wal_mode_with_a_long_busy_timeout(tmp_path):
+    # The server holds a connection on the request path while the background sync thread
+    # writes from another. Under the default rollback journal + 5s busy timeout, a sync
+    # or a product-index backfill longer than 5s made concurrent opens fail outright
+    # with "database is locked".
+    conn = nvd_cache.get_connection(tmp_path / "t.db")
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    assert nvd_cache.BUSY_TIMEOUT_SECONDS >= 60
+
+
+def test_concurrent_opens_do_not_deadlock_or_duplicate_the_backfill(tmp_path):
+    # Two connections opening the same legacy cache at once is the exact server startup
+    # shape (request path + background sync thread). Both must succeed, and the index
+    # must be built exactly once and completely.
+    import json as _json
+    import sqlite3
+    from concurrent.futures import ThreadPoolExecutor
+
+    db = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(db)
+    legacy.execute("CREATE TABLE cves (id TEXT PRIMARY KEY, published TEXT, last_modified TEXT, raw_json TEXT)")
+    legacy.executemany("INSERT INTO cves VALUES (?, ?, ?, ?)", [
+        (f"CVE-2024-{i:04d}", "p", "m", _json.dumps(_cve(f"CVE-2024-{i:04d}", product=f"pkg{i}")))
+        for i in range(200)
+    ])
+    legacy.commit()
+    legacy.close()
+
+    real = nvd_cache.ensure_product_index
+    backfilled = []
+
+    def spy(conn, **kwargs):
+        result = real(conn, **kwargs)
+        backfilled.append(result)
+        return result
+
+    def open_and_count(_):
+        # SQLite connections are thread-bound, so each thread checks its own and reports
+        # a plain number back rather than handing the connection across threads.
+        conn = nvd_cache.get_connection(db)
+        count = conn.execute("SELECT COUNT(*) FROM cve_products").fetchone()[0]
+        conn.close()
+        return count
+
+    with patch.object(nvd_cache, "ensure_product_index", spy):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            counts = list(pool.map(open_and_count, range(2)))
+
+    assert counts == [200, 200]  # both opens saw a complete index, neither errored
+    # Built exactly once: the winner backfilled 200, the loser waited and skipped.
+    assert sorted(backfilled) == [0, 200]
+
+    conn = nvd_cache.get_connection(db)
+    assert len(nvd_cache.query_by_product_name("pkg199", conn=conn)) == 1
+
+
 def test_sync_still_stores_results_from_a_client_that_ignores_on_page(tmp_path):
     # Back-compat: a fetch_fn that returns everything at once (older client, or a test
     # double) must not have its results silently dropped.

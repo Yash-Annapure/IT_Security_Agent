@@ -138,6 +138,24 @@ def _ensure_synced(conn):
     _last_synced = time.time()
 
 
+def _index_progress_printer(every_seconds=3.0):
+    """Throttled progress callback for the one-time product-index backfill.
+
+    On a full catalog this is tens of seconds during which the cache holds its write
+    lock; without output the server looks hung at startup.
+    """
+    state = {"last": 0.0}
+
+    def report(done, total):
+        now = time.time()
+        if now - state["last"] < every_seconds and done < total:
+            return
+        state["last"] = now
+        print(f"[index] building CPE product index: {done:,}/{total:,} CVEs", flush=True)
+
+    return report
+
+
 def _start_background_sync():
     """Kick off the NVD/KEV sync in a daemon thread at server startup.
 
@@ -152,7 +170,13 @@ def _start_background_sync():
 
     def work():
         try:
-            _ensure_synced(nvd_cache.get_connection())
+            # Opening the cache runs the one-time CPE product-index backfill if it's
+            # outstanding. Doing it here, on the startup thread, means a cold server
+            # absorbs it before the first request rather than inside one - the same
+            # reasoning as the sync itself. It reports progress because on a full
+            # catalog it is tens of seconds of otherwise silent work.
+            conn = nvd_cache.get_connection(index_progress=_index_progress_printer())
+            _ensure_synced(conn)
             print("[sync] NVD/KEV background sync complete.", flush=True)
         except Exception as exc:
             # A failed startup sync isn't fatal - the request path will retry lazily.

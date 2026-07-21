@@ -9,10 +9,31 @@ DB_PATH = Path(__file__).resolve().parent.parent / "nvd_cache.db"
 
 # Bump when _products_in() changes what it extracts, to force a rebuild of cve_products.
 PRODUCT_INDEX_VERSION = 1
+# The server opens this cache from more than one place at once: the request path holds a
+# connection while _start_background_sync() writes NVD/KEV updates from a daemon thread.
+# SQLite's 5s default busy timeout is shorter than either a catalog sync or a one-time
+# product-index backfill over ~365k CVEs, so a concurrent writer used to fail outright
+# with "database is locked" instead of waiting its turn.
+BUSY_TIMEOUT_SECONDS = 180
 
 
-def get_connection(db_path=None):
-    conn = sqlite3.connect(db_path or DB_PATH)
+def get_connection(db_path=None, index_progress=None):
+    conn = sqlite3.connect(db_path or DB_PATH, timeout=BUSY_TIMEOUT_SECONDS)
+    # WAL lets the scan path keep reading while the background sync writes - under the
+    # default rollback journal a writer blocks every reader for the length of its
+    # transaction, which on this workload means a sync stalling live scans.
+    #
+    # Switching journal mode needs a brief exclusive lock that the busy timeout does NOT
+    # cover, so a connection opened while another holds a write transaction would fail
+    # here with "database is locked". The mode is persistent once set and is a
+    # performance setting rather than a correctness one, so check first and let a
+    # contended attempt pass: the next open converts it.
+    try:
+        if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+            conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        pass
+    conn.execute("PRAGMA synchronous=NORMAL")  # durable enough for a rebuildable cache
     conn.execute(
         """CREATE TABLE IF NOT EXISTS cves (
             id TEXT PRIMARY KEY, published TEXT, last_modified TEXT, raw_json TEXT
@@ -37,7 +58,7 @@ def get_connection(db_path=None):
     # Caches built before cve_products existed are backfilled on first open rather than
     # in the scan path: correctness of query_by_product_name depends on the index being
     # complete, so it must not be possible to open this cache and query it unindexed.
-    ensure_product_index(conn)
+    ensure_product_index(conn, on_progress=index_progress)
     return conn
 
 
@@ -80,41 +101,65 @@ def _store_vulns(conn, vulns):
     conn.commit()
 
 
+def _index_is_current(conn) -> bool:
+    row = conn.execute(
+        "SELECT value FROM cache_meta WHERE key = 'product_index_version'").fetchone()
+    return bool(row) and row[0] == str(PRODUCT_INDEX_VERSION)
+
+
 def ensure_product_index(conn, on_progress=None, batch_size=5000) -> int:
     """Backfill cve_products for a cache populated before the index existed.
 
     Idempotent and cheap once built (one indexed read of cache_meta). The marker is
-    written only after the whole backfill commits, so an interrupted run rebuilds from
-    scratch next time rather than leaving a half-filled index that looks complete -
+    written only in the same transaction as the rows, so an interrupted run rebuilds
+    from scratch next time rather than leaving a half-filled index that looks complete -
     a silently partial index would under-report vulnerabilities, which is the one
     failure mode this cache must never have.
+
+    Concurrency matters here because the server opens this cache from the request path
+    and from the background sync thread at the same time. BEGIN IMMEDIATE makes the
+    backfill mutually exclusive: whichever connection gets there first does the work,
+    and the other blocks (up to BUSY_TIMEOUT_SECONDS), then re-checks the marker inside
+    the lock and returns having done nothing, rather than duplicating a long rebuild.
     """
-    current = conn.execute(
-        "SELECT value FROM cache_meta WHERE key = 'product_index_version'").fetchone()
-    if current and current[0] == str(PRODUCT_INDEX_VERSION):
+    if _index_is_current(conn):
         return 0
 
-    conn.execute("DELETE FROM cve_products")
-    total = conn.execute("SELECT COUNT(*) FROM cves").fetchone()[0]
-    done = 0
-    read_cur = conn.execute("SELECT raw_json FROM cves")
-    while True:
-        chunk = read_cur.fetchmany(batch_size)
-        if not chunk:
-            break
-        conn.executemany(
-            "INSERT OR REPLACE INTO cve_products (product, cve_id) VALUES (?, ?)",
-            _product_rows(json.loads(raw) for (raw,) in chunk),
-        )
-        done += len(chunk)
-        if on_progress is not None:
-            on_progress(done, total)
-    conn.execute(
-        "INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('product_index_version', ?)",
-        (str(PRODUCT_INDEX_VERSION),),
-    )
-    conn.commit()
-    return done
+    prior_isolation = conn.isolation_level
+    conn.isolation_level = None  # take explicit control; no implicit BEGIN underneath us
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if _index_is_current(conn):
+                conn.execute("ROLLBACK")  # another connection built it while we waited
+                return 0
+
+            conn.execute("DELETE FROM cve_products")
+            total = conn.execute("SELECT COUNT(*) FROM cves").fetchone()[0]
+            done = 0
+            read_cur = conn.execute("SELECT raw_json FROM cves")
+            while True:
+                chunk = read_cur.fetchmany(batch_size)
+                if not chunk:
+                    break
+                conn.executemany(
+                    "INSERT OR REPLACE INTO cve_products (product, cve_id) VALUES (?, ?)",
+                    _product_rows(json.loads(raw) for (raw,) in chunk),
+                )
+                done += len(chunk)
+                if on_progress is not None:
+                    on_progress(done, total)
+            conn.execute(
+                "INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('product_index_version', ?)",
+                (str(PRODUCT_INDEX_VERSION),),
+            )
+            conn.execute("COMMIT")
+            return done
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.isolation_level = prior_isolation
 
 
 def _sync(params, conn, fetch_fn, on_progress=None):

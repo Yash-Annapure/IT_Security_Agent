@@ -190,7 +190,8 @@ def main():
     print(f"Cache database: {nvd_cache.DB_PATH}", flush=True)
     print("  (opening - a cache built before the CPE product index will be backfilled now)",
           flush=True)
-    conn = nvd_cache.get_connection()
+    conn = nvd_cache.get_connection(index_progress=lambda done, total: print(
+        f"  building CPE product index: {done:,}/{total:,} CVEs", flush=True))
     before = _db_stats(conn)
     _print_stats("before", before)
     print(_coverage_line(before), flush=True)
