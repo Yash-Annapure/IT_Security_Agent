@@ -83,6 +83,64 @@ def test_rejected_findings_are_kept_not_dropped():
     assert result.rejected[0].cve == "CVE-2024-0002"
 
 
+def _run_with_vendor(vendor, trusted, confidence=0.9, kev_entry=None):
+    component = Component(name="jupyter", version="1.1.1", ecosystem="PyPI", source="test")
+    candidate = VendorCandidate(vendor=vendor, product="jupyter", signals={})
+    match = {"cve": "CVE-2022-41083", "severity": "HIGH", "cvss_score": 7.8, "vendor": vendor,
+             "vendor_candidate": candidate, "registry_trusted_vendors": frozenset(trusted)}
+    with patch("it_security_agent.matching.find_candidates", return_value=([match], [])), \
+         patch("it_security_agent.osv.query", return_value=[]), \
+         patch("it_security_agent.kev.load_kev_ids",
+               return_value={"CVE-2022-41083"} if kev_entry else set()), \
+         patch("it_security_agent.model.predict_confidence_batch",
+               side_effect=lambda m, rows: [confidence] * len(rows)), \
+         patch("it_security_agent.explain.explain_matches",
+               side_effect=lambda e, rows: [{"name_similarity": 0.1}] * len(rows)):
+        return agent.scan([component], "random_forest", MagicMock(), 0.15, MagicMock())
+
+
+def test_confident_match_on_a_vendor_the_registry_contradicts_goes_to_review():
+    # jupyter 1.1.1 confirmed CVE-2022-41083 ("Visual Studio Code Elevation of Privilege")
+    # at confidence 0.93, because the CPE vendor was `microsoft`. The registry page
+    # identifies the real vendor as `jupyter`, so this is a name collision, not a finding.
+    result = _run_with_vendor("microsoft", trusted={"jupyter"})
+    assert result.confirmed == []
+    assert len(result.review_queue) == 1
+    assert "likely a name collision" in result.review_queue[0].note
+    assert "`microsoft`" in result.review_queue[0].note and "`jupyter`" in result.review_queue[0].note
+
+
+def test_confident_match_on_the_registry_backed_vendor_still_confirms():
+    result = _run_with_vendor("jupyter", trusted={"jupyter"})
+    assert len(result.confirmed) == 1
+    assert result.review_queue == []
+
+
+def test_no_registry_backed_vendor_means_no_gate():
+    # uvicorn's repo moved (kludex/uvicorn), so no vendor scores registry_overlap - there
+    # is no better candidate to prefer, and a real finding must not be demoted on absence
+    # of evidence. This is the case that rules out a blanket "OSV disagrees -> review".
+    result = _run_with_vendor("encode", trusted=set())
+    assert len(result.confirmed) == 1
+    assert result.review_queue == []
+
+
+def test_kev_hit_escalates_even_when_the_vendor_looks_wrong():
+    # Missed vulnerabilities are weighted 10x false alarms, so an actively-exploited CVE
+    # stays in front of a human rather than being filtered by the vendor gate.
+    result = _run_with_vendor("microsoft", trusted={"jupyter"}, kev_entry=True)
+    assert len(result.escalated) == 1
+    assert result.review_queue == []
+
+
+def test_vendor_gate_does_not_fire_on_matches_the_model_already_rejected():
+    # Below threshold and uncorroborated: it was going to review anyway, and the note
+    # should stay the OSV one rather than being overwritten with a collision claim.
+    result = _run_with_vendor("microsoft", trusted={"jupyter"}, confidence=0.0)
+    assert len(result.review_queue) == 1
+    assert result.review_queue[0].note == "not corroborated by OSV"
+
+
 def test_osv_is_queried_once_per_component_not_once_per_match():
     # OSV is keyed on (ecosystem, name, version) - the component - so every candidate CVE
     # for a component shares one answer. Querying per match meant a component whose OSV

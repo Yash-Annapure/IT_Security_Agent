@@ -65,7 +65,15 @@ def english_description(cve):
 
 def find_candidates(component, conn=None):
     pinned = parse_version(component.version)
-    resolved = {c.vendor: c for c in normalize.resolve_vendor(component.name, component.ecosystem, conn=conn)}
+    candidates = normalize.resolve_vendor(component.name, component.ecosystem, conn=conn)
+    resolved = {c.vendor: c for c in candidates}
+    # Vendors whose CPE entry links to the same site as the package's registry page, i.e.
+    # the ones we can positively identify as this package's real owner. Built from the
+    # full candidate list, not `resolved` - a vendor can appear with several CPE entries
+    # and the dict above keeps only the last, which may be the one without the overlap.
+    trusted_vendors = frozenset(
+        c.vendor for c in candidates if c.signals.get("registry_overlap") is True
+    )
     seen = set()
     matches, rejected = [], []
     for spelling in name_variants(component.name):
@@ -94,6 +102,7 @@ def find_candidates(component, conn=None):
                     "cve": cve["id"], "severity": severity or "UNKNOWN", "cvss_score": score,
                     "cwe_ids": cwe_ids(cve.get("weaknesses")), "description": english_description(cve),
                     "vendor": matched_vendor, "vendor_candidate": resolved.get(matched_vendor),
+                    "registry_trusted_vendors": trusted_vendors,
                 })
             elif name_matched_at_all:
                 rejected.append(cve["id"])

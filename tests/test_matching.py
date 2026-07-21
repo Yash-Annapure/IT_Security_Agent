@@ -33,6 +33,25 @@ def test_find_candidates_matches_version_and_attaches_vendor_candidate():
     assert rejected == []
 
 
+def test_find_candidates_reports_which_vendors_the_registry_backs():
+    # A vendor can appear with several CPE entries, only some carrying registry_overlap.
+    # The trusted set must be built from the full candidate list - deduplicating by vendor
+    # first would drop the overlap whenever a non-overlapping entry happened to come last.
+    conn = nvd_cache.get_connection(":memory:")
+    component = Component(name="jupyter", version="1.0.0", ecosystem="PyPI", source="test")
+    backed = VendorCandidate(vendor="jupyter", product="jupyter", signals={"registry_overlap": True})
+    same_vendor_no_overlap = VendorCandidate(vendor="jupyter", product="jupyter",
+                                             signals={"registry_overlap": False})
+    other = VendorCandidate(vendor="microsoft", product="jupyter", signals={"registry_overlap": False})
+    with patch("it_security_agent.nvd_cache.query_by_product_name",
+               return_value=[_cve("CVE-2024-0001", "microsoft", "jupyter")]), \
+         patch("it_security_agent.normalize.resolve_vendor",
+               return_value=[backed, same_vendor_no_overlap, other]):
+        matches, _ = matching.find_candidates(component, conn=conn)
+    assert matches[0]["registry_trusted_vendors"] == frozenset({"jupyter"})
+    assert matches[0]["vendor"] == "microsoft"  # the CVE matched a vendor the registry contradicts
+
+
 def test_find_candidates_rejects_when_version_does_not_apply():
     conn = nvd_cache.get_connection(":memory:")
     component = Component(name="django", version="9.9.9", ecosystem="PyPI", source="test")

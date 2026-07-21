@@ -152,9 +152,10 @@ def test_get_scan_command_tees_instead_of_redirecting():
     # for its whole duration. The command must save the report AND stay on screen.
     ctx = _fake_ctx({"host": "example.test", "x-forwarded-proto": "https"})
     text = mcp_server.get_scan_command(ctx)
-    assert "Tee-Object -FilePath" in text  # PowerShell
-    assert "| tee reports/" in text        # bash/zsh
-    assert "-sN" in text                   # unbuffered, so stages appear as they happen
+    assert "Tee-Object -Variable report" in text      # PowerShell: stream + capture
+    assert "[IO.File]::WriteAllLines" in text          # ...saved as plain UTF-8, not UTF-16
+    assert "| tee reports/" in text                    # bash/zsh
+    assert "-sN" in text                               # unbuffered: stages appear live
     assert "DO NOT redirect this with `>`" in text
 
 

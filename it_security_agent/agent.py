@@ -112,10 +112,23 @@ def triage_component(component, winning_model_name, winning_model, threshold, ex
             cwe_ids=finding_data.get("cwe_ids", []), vendor=finding_data.get("vendor", ""),
         )
 
-        if confidence >= threshold or corroboration == "osv_agrees":
+        trusted = finding_data.get("registry_trusted_vendors") or frozenset()
+        vendor_conflict = bool(trusted) and finding_data.get("vendor") not in trusted
+        model_says_yes = confidence >= threshold or corroboration == "osv_agrees"
+
+        if model_says_yes and (kev_hit or not vendor_conflict):
+            # A KEV hit is exempt from the vendor gate on purpose: with a missed
+            # vulnerability weighted 10x a false alarm, an actively-exploited CVE belongs
+            # in front of a human even when the vendor looks wrong.
             (result.escalated if kev_hit else result.confirmed).append(f)
         else:
-            f.note = "not corroborated by OSV" if corroboration == "osv_disagrees" else "OSV not applicable to this ecosystem"
+            if vendor_conflict and model_says_yes:
+                f.note = (f"matched NVD vendor `{finding_data.get('vendor')}`, but this package's "
+                          f"registry page identifies its vendor as "
+                          f"{' or '.join(f'`{v}`' for v in sorted(trusted))} - likely a name collision")
+            else:
+                f.note = ("not corroborated by OSV" if corroboration == "osv_disagrees"
+                          else "OSV not applicable to this ecosystem")
             result.review_queue.append(f)
             needs_explaining.append((f, feature_signals))
 

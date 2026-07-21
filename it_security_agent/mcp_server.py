@@ -343,7 +343,8 @@ def _flagging_policy(meta: dict) -> list:
                   f"{model.FN_WEIGHT}x a false alarm - decision threshold **{m['threshold']:.2f}**.", ""]
     lines += [
         "- **escalated** - on CISA's Known Exploited Vulnerabilities list; exploited in the wild.",
-        "- **confirmed** - confidence cleared the threshold, *or* OSV.dev agrees for this version.",
+        "- **confirmed** - confidence cleared the threshold, *or* OSV.dev agrees for this "
+        "version, AND the CPE vendor isn't one the package's registry page contradicts.",
         "- **review_queue** - below threshold and uncorroborated. Undecided, not dismissed; "
         "carries SHAP values showing which signals moved the score.",
         "- **rejected** - name matched but the pinned version isn't affected, or no plausible "
@@ -587,15 +588,19 @@ def get_scan_command(ctx: Context) -> str:
         f"  Windows PowerShell (use this one on Windows - plain `curl` will NOT work "
         f"there):\n    New-Item -ItemType Directory -Force reports | Out-Null; "
         f"curl.exe -sN -X POST {base}/scan --data-binary \"@uv.lock\" | "
-        f"Tee-Object -FilePath \"{report_path}\"\n\n"
+        f"Tee-Object -Variable report; "
+        f"[IO.File]::WriteAllLines(\"$PWD\\{report_path.replace('/', chr(92))}\", $report)\n\n"
         f"  bash / zsh (Linux/macOS):\n    mkdir -p reports && "
         f"curl -sN -X POST {base}/scan --data-binary @uv.lock | tee {report_path}\n\n"
         "The quotes around \"@uv.lock\" are REQUIRED on PowerShell - an unquoted @ is "
         "a parse error there. Copy them exactly.\n\n"
-        "DO NOT redirect this with `>`. The tee/Tee-Object is deliberate: it writes the "
-        f"report to {report_path} AND lets each pipeline stage appear on screen as it "
-        "happens. A `>` redirect hides all of that, so the scan looks frozen for its "
-        "whole duration. `-N` keeps curl from buffering, for the same reason.\n\n"
+        "DO NOT redirect this with `>`, and do not simplify the PowerShell line. Each "
+        f"part earns its place: `Tee-Object -Variable` shows every pipeline stage on "
+        f"screen as it happens while capturing the text, and `[IO.File]::WriteAllLines` "
+        f"writes {report_path} as plain UTF-8. A `>` redirect hides all the progress "
+        "AND writes UTF-16 on some PowerShell hosts, which doubles the file size and "
+        "makes git treat the report as binary. `-N` stops curl buffering, so stages "
+        "appear as they happen rather than all at once at the end.\n\n"
         "You will see stages stream in - SBOM generation, cache coverage, CPE state, "
         "model training, SHAP, triage - then the finished report; usually seconds, up "
         "to ~2 minutes on the first run after a server restart. Wait for it to finish, "
