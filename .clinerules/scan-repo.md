@@ -105,6 +105,26 @@ what the tool returned (summary + SBOM section). Do this automatically for
 every scan, not only when the user explicitly asks for a saved report - it is
 part of finishing the task.
 
+**Do not summarize, template, or truncate the tool's output when writing this
+file.** Copy the literal text `scan_repo` returned, verbatim, character for
+character - including the full generated-SBOM JSON block. Never write
+placeholder text like `{ ... (lockfile content) ... }`, `{ ... (SBOM
+content) ... }`, `[contents here]`, or any other ellipsis/stand-in instead of
+the real content - a report containing a placeholder instead of real tool
+output is worse than no report, because it looks legitimate while being
+fabricated. If you cannot fit the full output for some reason, say so
+explicitly in the file and in chat rather than silently substituting a
+placeholder. Before writing the file, check your own draft: if it contains
+`...`, `[...]`, or a bracketed description instead of real JSON/text you
+copied from the tool result, you have not done this correctly - go back and
+use the actual tool output.
+
+If you claim "no vulnerabilities were found" anywhere in the report or in
+chat, that claim must trace back to a `scan_repo` tool result you actually
+received in this conversation - never state it as a default or a guess, and
+never state it if you have not actually called `scan_repo` and gotten a
+response back.
+
 If the user specifically asks for an HTML report instead of/in addition to
 markdown, wrap the same content in a minimal
 `<html><body><pre>...</pre></body></html>` shell (escape any `<`/`>`/`&` in
