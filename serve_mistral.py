@@ -25,16 +25,21 @@ none of the flash-attn/torch ABI breakage `vllm serve` was hitting. Trades
 away vLLM's throughput (continuous batching, paged attention) for something
 that Just Runs; fine for a single Cline session talking to one model.
 
-Defaults to Qwen/Qwen2.5-7B-Instruct, swapped in for Mistral-7B-Instruct-v0.3
-because Qwen2.5 already ships a tool-aware chat template in its own
-tokenizer_config.json (hermes-style `<tool_call>{...}</tool_call>` blocks) -
-no custom template override needed, unlike the MISTRAL_TOOL_CHAT_TEMPLATE
-hack this file used to carry. `parse_tool_calls()` below parses that
-Qwen/hermes format specifically; swapping MODEL_ID to a model with a
-different tool-call syntax (e.g. back to a Mistral model) needs that
-function changed too, not just the env var.
+Defaults to Qwen/Qwen2.5-14B-Instruct (bumped up from the 7B variant - the 7B
+model proved unreliable at sticking to real tool-call arguments in practice,
+repeatedly retrying the same invalid placeholder instead of correcting after
+a clear rejection; see git history around this comment for the transcripts).
+Qwen2.5 ships a tool-aware chat template in its own tokenizer_config.json
+(hermes-style `<tool_call>{...}</tool_call>` blocks) at every size in the
+family, so this is a same-format swap - no custom template override needed,
+and `parse_tool_calls()` below didn't need to change at all. Needs roughly
+28-30GB of VRAM in bf16; confirm that's actually free on whatever GPU serves
+this before switching (`nvidia-smi --query-gpu=memory.free --format=csv`).
+Swapping MODEL_ID to a model with a different tool-call syntax entirely
+(e.g. back to a Mistral model) would need parse_tool_calls() changed too,
+not just this env var.
 
-Env vars: MODEL_ID (default Qwen/Qwen2.5-7B-Instruct), HOST (default
+Env vars: MODEL_ID (default Qwen/Qwen2.5-14B-Instruct), HOST (default
 0.0.0.0), PORT (default 8000, matching the README's vLLM instructions so no
 Cline config change is needed), HF_TOKEN (only if the model needs auth).
 """
@@ -55,18 +60,20 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import Request
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2.5-7B-Instruct")
+MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2.5-14B-Instruct")
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8000"))
 
-# Qwen2.5-7B-Instruct's real trained context is 32768 tokens - not the tokenizer's much
-# higher default model_max_length sanity-check value, which only catches truly absurd
-# inputs and does nothing to stop a prompt that overshoots the model's actual positional
-# embeddings. This project hit that directly: a 176,548-character raw uv.lock pushed one
-# request to ~135,000 tokens, which both exceeded the model's real limit *and* OOM'd the
-# GPU allocating KV-cache space for it. Reject oversized prompts before model.generate()
-# ever runs instead of finding out via a CUDA crash. Leave headroom below 32768 for
-# max_new_tokens plus the templating overhead apply_chat_template adds.
+# The Qwen2.5-Instruct family's real trained context is 32768 tokens at every size
+# (0.5B through 72B, including the 14B default above) - not the tokenizer's much higher
+# default model_max_length sanity-check value, which only catches truly absurd inputs and
+# does nothing to stop a prompt that overshoots the model's actual positional embeddings.
+# This project hit that directly: a 176,548-character raw uv.lock pushed one request to
+# ~135,000 tokens, which both exceeded the model's real limit *and* OOM'd the GPU
+# allocating KV-cache space for it. Reject oversized prompts before model.generate() ever
+# runs instead of finding out via a CUDA crash. Leave headroom below 32768 for
+# max_new_tokens plus the templating overhead apply_chat_template adds. If MODEL_ID is
+# ever changed to a model with a different real context length, update this to match.
 MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "28000"))
 TOOL_CALL_START = "<tool_call>"
 TOOL_CALL_END = "</tool_call>"

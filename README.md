@@ -93,20 +93,34 @@ There's no built-in auth, so only expose this on a private/trusted network.
 A `.env` file with `NVD_API_KEY` is optional but strongly recommended -
 without it every NVD/CPE request is spaced 6s apart instead of 1s.
 
-Separately, host Qwen2.5-7B-Instruct with tool calling on the same box:
+Separately, host Qwen2.5-14B-Instruct with tool calling on the same box:
 ```
-vllm serve Qwen/Qwen2.5-7B-Instruct \
+vllm serve Qwen/Qwen2.5-14B-Instruct \
   --host 0.0.0.0 --port 8000 \
-  --enable-auto-tool-choice --tool-call-parser hermes
+  --enable-auto-tool-choice --tool-call-parser hermes \
+  --gpu-memory-utilization 0.85
 ```
 Qwen2.5's own `tokenizer_config.json` already ships a working tool-calling
-chat template (hermes-style `<tool_call>` blocks) - unlike Mistral, no
-`--chat-template` override is needed. Any other OpenAI-compatible server
-(TGI, Ollama, `serve_mistral.py` in this repo, etc.) works the same way from
-Cline's side; only the serving command differs. Note Qwen2.5-7B-Instruct's
-real context is 32768 tokens - see "Keeping lockfiles small enough to fit in
-context" below, since a raw lockfile can overflow that in one message on a
-real dependency tree.
+chat template (hermes-style `<tool_call>` blocks) at every size in the
+family - unlike Mistral, no `--chat-template` override is needed, and this
+is why moving up from the 7B variant (see below) needed no code changes to
+`serve_mistral.py`'s response parsing, only the model name. Any other
+OpenAI-compatible server (TGI, Ollama, `serve_mistral.py` in this repo, etc.)
+works the same way from Cline's side; only the serving command differs.
+
+**14B needs real headroom - check before running:**
+`nvidia-smi --query-gpu=memory.total,memory.used,memory.free --format=csv`
+first. Qwen2.5-14B-Instruct needs roughly 28-30GB of VRAM in bf16; the
+`--gpu-memory-utilization 0.85` flag above caps how much of the GPU vLLM
+will try to claim, which matters on a shared/multi-tenant box where other
+processes may hold memory vLLM can't see reflected in a clean number. A 7B
+variant (`Qwen/Qwen2.5-7B-Instruct`, ~14GB) is a safer fallback if VRAM is
+tight - same tool-call format, same command shape, just less reliable in
+practice at sticking to correct tool-call arguments than the 14B (see this
+project's own history for why the jump was made). Note Qwen2.5-Instruct's
+real context is 32768 tokens at every size - see "Keeping lockfiles small
+enough to fit in context" below, since a raw lockfile can overflow that in
+one message on a real dependency tree.
 
 ### In Cline (VS Code extension)
 
@@ -114,7 +128,8 @@ real dependency tree.
 - Base URL: `http://<datalab-server>:8000/v1`
 - API Key: any non-empty placeholder (vLLM ignores it unless you've
   configured auth)
-- Model ID: `Qwen/Qwen2.5-7B-Instruct`
+- Model ID: `Qwen/Qwen2.5-14B-Instruct` (or whichever `MODEL_ID`/`vllm serve`
+  argument you actually used)
 
 **Tool** - "Configure MCP Servers" -> paste the JSON block `serve.py` printed.
 

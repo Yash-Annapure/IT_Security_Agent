@@ -3,7 +3,7 @@
 Three MCP tools are available on the `it-security-agent` server:
 `condense_lockfile`, `scan_repo`, and `get_setup_rules`. Together they check
 this repo's dependencies against NVD, CISA KEV, and OSV.dev, and return a
-triaged findings report. You may be running as a small (~7B) local model -
+triaged findings report. You may be running as a small (~7-14B) local model -
 follow these steps literally, in order, every time.
 
 ## Hard rules - read this list first, every time
