@@ -190,26 +190,29 @@ def test_scan_repo_returns_triaged_summary_when_pipeline_succeeds():
     })
 
 
-def test_scan_repo_includes_generated_sbom_by_default():
+def test_scan_repo_omits_generated_sbom_by_default():
+    # Default is False: the SBOM is a full CycloneDX document (one entry per
+    # component, tens of KB on a real dependency tree) - not worth the cost on
+    # every routine vulnerability check when nobody asked for it.
     with patch.object(mcp_server, "get_connection", return_value="conn"), \
          patch.object(mcp_server, "_ensure_synced"), \
          patch.object(mcp_server, "prewarm"), \
          patch.object(mcp_server, "run_pipeline", return_value=None), \
          patch.object(mcp_server, "raw_matches", return_value=[]):
         text = mcp_server.scan_repo(lockfile_content=UV_LOCK_TEXT)
-    assert "Generated SBOM" in text
-    assert '"bomFormat": "CycloneDX"' in text
-    assert '"name": "django"' in text
+    assert "Generated SBOM" not in text
 
 
-def test_scan_repo_can_omit_generated_sbom():
+def test_scan_repo_includes_generated_sbom_when_requested():
     with patch.object(mcp_server, "get_connection", return_value="conn"), \
          patch.object(mcp_server, "_ensure_synced"), \
          patch.object(mcp_server, "prewarm"), \
          patch.object(mcp_server, "run_pipeline", return_value=None), \
          patch.object(mcp_server, "raw_matches", return_value=[]):
-        text = mcp_server.scan_repo(lockfile_content=UV_LOCK_TEXT, include_sbom=False)
-    assert "Generated SBOM" not in text
+        text = mcp_server.scan_repo(lockfile_content=UV_LOCK_TEXT, include_sbom=True)
+    assert "Generated SBOM" in text
+    assert '"bomFormat": "CycloneDX"' in text
+    assert '"name": "django"' in text
 
 
 def test_scan_repo_generated_sbom_covers_full_list_not_just_scanned_subset():
@@ -224,7 +227,7 @@ def test_scan_repo_generated_sbom_covers_full_list_not_just_scanned_subset():
          patch.object(mcp_server, "prewarm"), \
          patch.object(mcp_server, "run_pipeline", return_value=None), \
          patch.object(mcp_server, "raw_matches", return_value=[]):
-        text = mcp_server.scan_repo(lockfile_content=lock, max_components=2)
+        text = mcp_server.scan_repo(lockfile_content=lock, max_components=2, include_sbom=True)
     assert "5 components" in text  # SBOM section header
     for i in range(5):
         assert f'"name": "pkg{i}"' in text

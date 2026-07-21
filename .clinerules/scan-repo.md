@@ -64,6 +64,17 @@ If you can't find a lockfile at the project root, say so and ask the user
 where their dependency file lives - do not guess or invent one, and do not
 substitute some other unrelated file just because it's open or nearby.
 
+## Leave `include_sbom` alone unless the user asks for an SBOM
+
+`scan_repo`'s default (`include_sbom=False`) already skips generating the
+SBOM section - do not pass `include_sbom=True` unless the user specifically
+asked for "an SBOM," "a CycloneDX document," or similar. It's a real, full
+bill of materials with an entry per component and can be tens of KB on a
+real dependency tree - carrying that through the conversation on every
+routine vulnerability check (and then reproducing it verbatim into a report,
+per the rule below) is pure token cost nobody asked for. A plain "check this
+repo for vulnerabilities" request never needs it.
+
 ## There is no "pass in an existing SBOM" option - this is intentional
 
 `scan_repo` only accepts `lockfile_content`. If you find an existing SBOM file
@@ -78,9 +89,10 @@ its own SBOM from that lockfile itself, every call - it never trusts one
 handed to it.
 
 If the user asks for "an SBOM" specifically (not just a vulnerability check),
-`scan_repo`'s response includes one anyway - a "Generated SBOM" section built
-fresh from the lockfile you gave it. That section *is* the answer; don't say
-you can't generate one, and don't go looking for a pre-existing SBOM file to
+call `scan_repo` with `include_sbom=True` and its response will include one -
+a "Generated SBOM" section built fresh from the lockfile you gave it. That
+section *is* the answer; don't say you can't generate one, and don't go
+looking for a pre-existing SBOM file to
 use instead. If the user wants it saved as a file (e.g. `sbom.cdx.json`),
 write it yourself with your file tool - the MCP server has no access to
 their local filesystem, only you do.

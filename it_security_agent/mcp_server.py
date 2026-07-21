@@ -274,7 +274,7 @@ def scan_repo(
     lockfile_content: str = "",
     lockfile_type: str = "",
     max_components: int = 40,
-    include_sbom: bool = True,
+    include_sbom: bool = False,
 ) -> str:
     """Scan a Python/npm dependency list for known vulnerabilities (NVD + CISA KEV + OSV.dev).
 
@@ -301,7 +301,11 @@ def scan_repo(
             call fast). Extra components are silently dropped, not erred on - the
             generated SBOM still covers all of them (see include_sbom).
         include_sbom: Whether to include the generated SBOM's full JSON in the
-            response. Default True.
+            response. Default False - the SBOM is a real CycloneDX document with an
+            entry per component and can be tens of KB on a real dependency tree,
+            which is wasted cost on every call when nobody asked for it. Set True
+            only when the user specifically wants an SBOM, not for a routine
+            vulnerability check.
 
     The first call after server startup (or after 6h of uptime) can take 1-2
     minutes because it syncs NVD's CVE catalog first; subsequent calls are fast.
