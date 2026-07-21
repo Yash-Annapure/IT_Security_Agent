@@ -133,3 +133,21 @@ If you ask for "an SBOM" and the repo only has a lockfile, `scan_repo`
 generates one from it (a real CycloneDX document, not a description of one)
 and returns it inline alongside the findings - `.clinerules/` tells the model
 this counts as the answer, not a "can't do that" response.
+
+### Using it against a different repo for the first time
+
+The MCP server is registered once in Cline's settings (globally, not per
+repo), so pointing Cline at some other project and asking it to check for
+vulnerabilities works immediately - except that other repo won't have this
+project's `.clinerules/scan-repo.md` yet, so the model won't know the
+lockfile-first workflow, the "no pre-made SBOM" rule, etc.
+
+A second tool, `get_setup_rules`, closes that gap: the server-wide MCP
+`instructions` field (sent to the client alongside the tool list, so it's
+visible even in a repo with no `.clinerules/` at all) tells the model to
+check locally for `.clinerules/scan-repo.md` before its first scan in any
+repo, and if missing, call `get_setup_rules` and write the returned text
+there verbatim - a one-time per-repo bootstrap. The text it returns is read
+straight from this repo's own `.clinerules/scan-repo.md`, so the two never
+drift - edit that one file and both this project's Cline setup and every
+newly-bootstrapped repo pick up the change.

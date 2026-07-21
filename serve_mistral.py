@@ -9,14 +9,14 @@
 #   "sentencepiece>=0.2",
 # ]
 # ///
-"""Self-contained Mistral-7B-Instruct host - no vLLM, no flash-attn.
+"""Self-contained local-model host - no vLLM, no flash-attn.
 
     uv run serve_mistral.py
 
 `uv run` reads the dependency block above and installs everything into an
 isolated env automatically (separate from this repo's own uv.lock) - nothing
-to `pip install` by hand. First run downloads the model from Hugging Face
-(~15GB) and caches it; later runs just load from cache.
+to `pip install` by hand. First run downloads the model from Hugging Face and
+caches it; later runs just load from cache.
 
 Serves the same OpenAI-compatible `/v1/chat/completions` surface vLLM did,
 on the same default host:port, using plain `transformers` generation with
@@ -25,9 +25,18 @@ none of the flash-attn/torch ABI breakage `vllm serve` was hitting. Trades
 away vLLM's throughput (continuous batching, paged attention) for something
 that Just Runs; fine for a single Cline session talking to one model.
 
-Env vars: MODEL_ID (default mistralai/Mistral-7B-Instruct-v0.3), HOST
-(default 0.0.0.0), PORT (default 8000, matching the README's vLLM instructions
-so no Cline config change is needed), HF_TOKEN (only if the model needs auth).
+Defaults to Qwen/Qwen2.5-7B-Instruct, swapped in for Mistral-7B-Instruct-v0.3
+because Qwen2.5 already ships a tool-aware chat template in its own
+tokenizer_config.json (hermes-style `<tool_call>{...}</tool_call>` blocks) -
+no custom template override needed, unlike the MISTRAL_TOOL_CHAT_TEMPLATE
+hack this file used to carry. `parse_tool_calls()` below parses that
+Qwen/hermes format specifically; swapping MODEL_ID to a model with a
+different tool-call syntax (e.g. back to a Mistral model) needs that
+function changed too, not just the env var.
+
+Env vars: MODEL_ID (default Qwen/Qwen2.5-7B-Instruct), HOST (default
+0.0.0.0), PORT (default 8000, matching the README's vLLM instructions so no
+Cline config change is needed), HF_TOKEN (only if the model needs auth).
 """
 from __future__ import annotations
 
@@ -46,10 +55,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import Request
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL_ID = os.environ.get("MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.3")
+MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2.5-7B-Instruct")
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8000"))
-TOOL_CALL_TOKEN = "[TOOL_CALLS]"
+TOOL_CALL_START = "<tool_call>"
+TOOL_CALL_END = "</tool_call>"
 
 generate_lock = Lock()
 
@@ -69,7 +79,7 @@ def _detect_reachable_host() -> str | None:
 
 def startup_banner() -> str:
     public_host = _detect_reachable_host() if HOST == "0.0.0.0" else HOST
-    lines = ["=" * 70, f"Mistral host (transformers): {MODEL_ID}", "=" * 70, f"Listening on {HOST}:{PORT}", ""]
+    lines = ["=" * 70, f"Local model host (transformers): {MODEL_ID}", "=" * 70, f"Listening on {HOST}:{PORT}", ""]
     if public_host is None:
         lines += ["Could not auto-detect this machine's reachable IP - use whatever",
                    "address/hostname other machines on your network use to reach it."]
@@ -86,109 +96,12 @@ def startup_banner() -> str:
     return "\n".join(lines)
 
 
-# vLLM's own tool-calling chat template for Mistral (examples/tool_chat_template_mistral.jinja
-# in the vLLM repo) - the same fix the README already points to for vLLM itself ("some
-# Mistral-7B-Instruct revisions need the explicit chat-template"). Forced on by default here
-# rather than trusting the model repo's bundled tokenizer_config.json template, which has a
-# history of being inconsistent about system-message + tool-schema rendering for this model.
-# Set USE_VLLM_TOOL_TEMPLATE=0 to fall back to the model repo's own template instead.
-MISTRAL_TOOL_CHAT_TEMPLATE = r"""{%- if messages[0]["role"] == "system" %}
-    {%- set system_message = messages[0]["content"] %}
-    {%- set loop_messages = messages[1:] %}
-{%- else %}
-    {%- set loop_messages = messages %}
-{%- endif %}
-{%- if not tools is defined %}
-    {%- set tools = none %}
-{%- endif %}
-{%- set user_messages = loop_messages | selectattr("role", "equalto", "user") | list %}
-
-{%- for message in loop_messages | rejectattr("role", "equalto", "tool") | rejectattr("role", "equalto", "tool_results") | selectattr("tool_calls", "undefined") %}
-    {%- if (message["role"] == "user") != (loop.index0 % 2 == 0) %}
-        {{- raise_exception("After the optional system message, conversation roles must alternate user/assistant/user/assistant/...") }}
-    {%- endif %}
-{%- endfor %}
-
-{{- bos_token }}
-{%- for message in loop_messages %}
-    {%- if message["role"] == "user" %}
-        {%- if tools is not none and (message == user_messages[-1]) %}
-            {{- "[AVAILABLE_TOOLS] [" }}
-            {%- for tool in tools %}
-                {%- set tool = tool.function %}
-                {{- '{"type": "function", "function": {' }}
-                {%- for key, val in tool.items() if key != "return" %}
-                    {%- if val is string %}
-                        {{- '"' + key + '": "' + val + '"' }}
-                    {%- else %}
-                        {{- '"' + key + '": ' + val|tojson }}
-                    {%- endif %}
-                    {%- if not loop.last %}
-                        {{- ", " }}
-                    {%- endif %}
-                {%- endfor %}
-                {{- "}}" }}
-                {%- if not loop.last %}
-                    {{- ", " }}
-                {%- else %}
-                    {{- "]" }}
-                {%- endif %}
-            {%- endfor %}
-            {{- "[/AVAILABLE_TOOLS]" }}
-        {%- endif %}
-        {%- if loop.last and system_message is defined %}
-            {{- "[INST] " + system_message + "\n\n" + message["content"] + "[/INST]" }}
-        {%- else %}
-            {{- "[INST] " + message["content"] + "[/INST]" }}
-        {%- endif %}
-    {%- elif message["role"] == "tool_calls" or message.tool_calls is defined %}
-        {%- if message.tool_calls is defined %}
-            {%- set tool_calls = message.tool_calls %}
-        {%- else %}
-            {%- set tool_calls = message.content %}
-        {%- endif %}
-        {{- "[TOOL_CALLS] [" }}
-        {%- for tool_call in tool_calls %}
-            {%- set out = tool_call.function|tojson %}
-            {{- out[:-1] }}
-            {%- if not tool_call.id is defined or tool_call.id|length < 9 %}
-                {{- raise_exception("Tool call IDs should be alphanumeric strings with length >= 9! (1)" + tool_call.id) }}
-            {%- endif %}
-            {{- ', "id": "' + tool_call.id[-9:] + '"}' }}
-            {%- if not loop.last %}
-                {{- ", " }}
-            {%- else %}
-                {{- "]" + eos_token }}
-            {%- endif %}
-        {%- endfor %}
-    {%- elif message["role"] == "assistant" %}
-        {{- " " + message["content"] + eos_token }}
-    {%- elif message["role"] == "tool_results" or message["role"] == "tool" %}
-        {%- if message.content is defined and message.content.content is defined %}
-            {%- set content = message.content.content %}
-        {%- else %}
-            {%- set content = message.content %}
-        {%- endif %}
-        {{- '[TOOL_RESULTS] {"content": ' + content|string + ", " }}
-        {%- if not message.tool_call_id is defined or message.tool_call_id|length < 9 %}
-            {{- raise_exception("Tool call IDs should be alphanumeric strings with length >= 9! (2)" + message.tool_call_id) }}
-        {%- endif %}
-        {{- '"call_id": "' + message.tool_call_id[-9:] + '"}[/TOOL_RESULTS]' }}
-    {%- else %}
-        {{- raise_exception("Only user and assistant roles are supported, with the exception of an initial optional system message!") }}
-    {%- endif %}
-{%- endfor %}
-"""
-
 print(f"Loading {MODEL_ID} ...", flush=True)
 dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 if not torch.cuda.is_available():
     print("WARNING: no CUDA GPU detected - running a 7B model on CPU will be very slow.", flush=True)
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-if os.environ.get("USE_VLLM_TOOL_TEMPLATE", "1") == "1":
-    tokenizer.chat_template = MISTRAL_TOOL_CHAT_TEMPLATE
-    print("Using vLLM's tool-calling chat template (override).", flush=True)
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     torch_dtype=dtype,
@@ -216,35 +129,44 @@ async def normalize_path(request: Request, call_next):
 
 
 def parse_tool_calls(text: str) -> tuple[str, list[dict] | None]:
-    """Split Mistral's `[TOOL_CALLS][...]` output into (leading text, OpenAI-style tool_calls)."""
-    if TOOL_CALL_TOKEN not in text:
+    """Split Qwen/hermes-style `<tool_call>{...}</tool_call>` blocks out of raw
+    generated text into (leading text, OpenAI-style tool_calls).
+
+    Qwen2.5 can emit more than one `<tool_call>` block in a single turn (unlike
+    Mistral's one `[TOOL_CALLS] [...]` JSON array) - each block holds its own
+    JSON object, so they're parsed independently and a malformed block is
+    skipped rather than failing the whole response.
+    """
+    if TOOL_CALL_START not in text:
         return text.strip(), None
-    before, _, after = text.partition(TOOL_CALL_TOKEN)
-    after = after.strip()
-    try:
-        calls_raw, _ = json.JSONDecoder().raw_decode(after)
-    except json.JSONDecodeError:
-        return text.strip(), None
-    tool_calls = [
-        {
+    leading = text.split(TOOL_CALL_START, 1)[0].strip()
+    pattern = re.escape(TOOL_CALL_START) + r"(.*?)" + re.escape(TOOL_CALL_END)
+    tool_calls = []
+    for block in re.findall(pattern, text, re.DOTALL):
+        try:
+            call = json.loads(block.strip())
+        except json.JSONDecodeError:
+            continue
+        tool_calls.append({
             "id": f"call_{uuid.uuid4().hex[:24]}",
             "type": "function",
             "function": {
                 "name": call["name"],
                 "arguments": json.dumps(call.get("arguments", {})),
             },
-        }
-        for call in calls_raw
-    ]
-    return before.strip(), tool_calls
+        })
+    if not tool_calls:
+        return text.strip(), None
+    return leading, tool_calls
 
 
 def _flatten_content(content):
     # Some OpenAI clients (Cline included) send `content` as a list of parts -
     # [{"type": "text", "text": "..."}] - even for plain text messages, not just
-    # multimodal ones. Mistral's chat template assumes a plain string and does
-    # `content + "..."`, which TypeErrors on a list. Flatten to text; non-text
-    # parts (e.g. images) are silently dropped since this is a text-only model.
+    # multimodal ones. The tokenizer's chat template assumes a plain string and
+    # does `content + "..."`, which TypeErrors on a list. Flatten to text;
+    # non-text parts (e.g. images) are silently dropped since this is a
+    # text-only model.
     if not isinstance(content, list):
         return content
     parts = []

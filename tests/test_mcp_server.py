@@ -1,5 +1,6 @@
 import json
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -57,6 +58,18 @@ def test_bounded_get_sets_a_20s_timeout():
         result = mcp_server._bounded_get("http://example.test", headers={})
     assert result == "response"
     assert mock_get.call_args.kwargs["timeout"] == 20
+
+
+def test_get_setup_rules_returns_the_bundled_clinerules_file_verbatim():
+    on_disk = mcp_server.CLINERULES_PATH.read_text(encoding="utf-8")
+    assert mcp_server.get_setup_rules() == on_disk
+    assert "scan_repo" in on_disk  # sanity: it's actually the rules file, not something else
+
+
+def test_get_setup_rules_raises_clearly_if_bundled_file_is_missing():
+    with patch.object(mcp_server, "CLINERULES_PATH", Path("nonexistent") / "scan-repo.md"):
+        with pytest.raises(FileNotFoundError):
+            mcp_server.get_setup_rules()
 
 
 def test_get_connection_caches_across_calls():

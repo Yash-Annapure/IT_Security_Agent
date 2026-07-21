@@ -37,6 +37,7 @@ REQUEST_SPACING_SECONDS = 1 if NVD_API_KEY else 6
 SYNC_INTERVAL_SECONDS = 6 * 3600  # re-sync NVD/KEV at most once per 6h server uptime
 PREWARM_BUDGET_SECONDS = 90  # same "skip on failure, give up after a budget" policy as the notebook
 MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
+CLINERULES_PATH = Path(__file__).resolve().parent.parent / ".clinerules" / "scan-repo.md"
 
 # 0.0.0.0 by default: this is meant to be run on a remote box (a "datalab server")
 # and reached from wherever Cline is. There's no built-in auth - it's meant for a
@@ -44,7 +45,23 @@ MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
 MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8765"))
 
-mcp = FastMCP("it-security-agent", host=MCP_HOST, port=MCP_PORT)
+# `instructions` is server-wide guidance some MCP clients (Cline included) surface
+# alongside the tool list, independent of any single tool's own docstring - the one
+# place that's guaranteed visible in a brand-new repo that has no .clinerules/ yet,
+# which is exactly the chicken-and-egg problem get_setup_rules() below exists to solve.
+mcp = FastMCP(
+    "it-security-agent",
+    host=MCP_HOST,
+    port=MCP_PORT,
+    instructions=(
+        "Before your first scan_repo call in any given repo, check locally (with "
+        "your own file tool) whether that repo already has a .clinerules/scan-repo.md "
+        "file. If it doesn't, call get_setup_rules once, write its returned text "
+        "verbatim to .clinerules/scan-repo.md at that repo's root, then proceed. "
+        "This is a one-time per-repo bootstrap - never call get_setup_rules if that "
+        "file already exists, and never repeat this check more than once per repo."
+    ),
+)
 
 _conn = None
 _last_synced = 0.0
@@ -203,6 +220,32 @@ def format_sbom_section(bom: dict) -> str:
 
 
 @mcp.tool()
+def get_setup_rules() -> str:
+    """Return this project's Cline rules file verbatim, to bootstrap a new repo.
+
+    Call this once, before your first `scan_repo` call, in any repo that does
+    not yet have a `.clinerules/scan-repo.md` file - check locally with your
+    own file tool first; this server has no access to the caller's filesystem
+    to check for you. Write the text this returns, unmodified, to
+    `.clinerules/scan-repo.md` at that repo's root (creating the
+    `.clinerules/` directory if needed). Cline auto-loads every `.md`/`.txt`
+    file under `.clinerules/` on every task in that repo from then on, so this
+    is a one-time setup step per repo, not something to redo each session.
+
+    Do not call this if `.clinerules/scan-repo.md` already exists in the
+    target repo - it may have been hand-edited since, and this would silently
+    overwrite that.
+    """
+    if not CLINERULES_PATH.exists():
+        raise FileNotFoundError(
+            f"Bundled rules file missing on the server at {CLINERULES_PATH} - "
+            "this is a server-side install problem, not something fixable by "
+            "retrying or by the caller."
+        )
+    return CLINERULES_PATH.read_text(encoding="utf-8")
+
+
+@mcp.tool()
 def scan_repo(
     lockfile_content: str = "",
     lockfile_type: str = "",
@@ -219,6 +262,10 @@ def scan_repo(
 
     This server has no filesystem access to the caller's machine - read the
     lockfile yourself first, then pass its raw text here.
+
+    First time in this repo? If it has no `.clinerules/scan-repo.md` yet, call
+    `get_setup_rules` first and write its output there (see that tool's
+    docstring) - a one-time bootstrap, not a repeat-every-session step.
 
     Args:
         lockfile_content: Raw text of a `uv.lock`, `package-lock.json`, or

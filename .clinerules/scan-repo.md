@@ -2,14 +2,26 @@
 
 An MCP tool called `scan_repo` is available (server: `it-security-agent`). It
 checks this repo's dependencies against NVD, CISA KEV, and OSV.dev, and
-returns a triaged findings report. You are likely running as a small model
-(Mistral-7B-Instruct) - follow these steps literally, in order, every time.
+returns a triaged findings report. You may be running as a small (~7B) local
+model - follow these steps literally, in order, every time.
 
 ## When to use it
 
 Use `scan_repo` whenever the user asks you to check this repo (or its
 dependencies) for vulnerabilities, CVEs, or security issues. Do not answer
 that kind of question from memory or training data - always call the tool.
+
+## Commit to action - do not re-plan
+
+If you can already state the two steps below, or you've already read the
+lockfile earlier in this conversation, do not describe the plan again and do
+not ask the user to confirm it - perform step 1 (if not already done) and
+then step 2, immediately, in the same turn. Restating this same plan more
+than once without making tool-call progress is a known failure mode small
+models hit on this exact task - break out of it by acting, not by
+re-explaining. If you are in Cline's Plan mode, you cannot call tools at all;
+say so plainly and ask the user to switch to Act mode rather than silently
+re-describing the plan on every reply.
 
 ## How to call it (do these two steps in order)
 
@@ -82,3 +94,20 @@ that these are unscored raw matches, not confirmed vulnerabilities.
 Never state a CVE ID, severity, or CVSS score that isn't literally present in
 the tool's output. If the tool found nothing, say that plainly instead of
 padding the answer.
+
+## Also save the result to disk - every time, without being asked
+
+After `scan_repo` returns, in the same turn, write its full text output to a
+file in this repo using your normal file-write tool - the MCP server has no
+filesystem access, only you do. Create the `reports/` directory first if it
+doesn't exist, then write `reports/<YYYY-MM-DD>-scan.md` containing exactly
+what the tool returned (summary + SBOM section). Do this automatically for
+every scan, not only when the user explicitly asks for a saved report - it is
+part of finishing the task.
+
+If the user specifically asks for an HTML report instead of/in addition to
+markdown, wrap the same content in a minimal
+`<html><body><pre>...</pre></body></html>` shell (escape any `<`/`>`/`&` in
+the tool's text first) and write that to `reports/<YYYY-MM-DD>-scan.html`
+instead. Report both the chat summary and the file path you wrote to - don't
+stop at printing the summary in chat.
