@@ -61,22 +61,29 @@ mcp = FastMCP(
     "it-security-agent",
     host=MCP_HOST,
     port=MCP_PORT,
+    # Order matters more than completeness here. This text is the only guidance
+    # guaranteed to reach a model in a repo that has no .clinerules/ yet, and it is read
+    # by small local models. An earlier version opened with the conditional bootstrap
+    # procedure, so the first concrete instruction a model met was "check with your own
+    # file tool" - it reached for the file tool, read package-lock.json, and overflowed
+    # its context before ever calling a tool here. The prohibition whose violation is
+    # fatal now comes first, the single action second, and the bootstrap last.
     instructions=(
-        "Before your first scan_repo call in any given repo, check locally (with "
-        "your own file tool) whether that repo already has a .clinerules/scan-repo.md "
-        "file. If it doesn't, call get_setup_rules once, write its returned text "
-        "verbatim to .clinerules/scan-repo.md at that repo's root, then proceed. "
-        "This is a one-time per-repo bootstrap - never call get_setup_rules if that "
-        "file already exists, and never repeat this check more than once per repo. "
-        "NEVER read or open a raw lockfile (uv.lock, package-lock.json, "
-        "requirements.txt) with your file tool or print it with type/cat - raw "
-        "lockfiles are often large enough to overflow your entire context window in "
-        "one message. The whole scan is three trivial actions: (1) call the "
-        "get_scan_command tool, (2) run the single command it returns, exactly as "
-        "printed, (3) save that command's printed output as the report. Never guess "
-        "or reuse a server URL (it changes on reboot - get_scan_command always has "
-        "the current one), never invent a web address for any MCP tool, and never "
-        "wrap the command in $(...) or nest it inside another command."
+        "NEVER read, open, or print a lockfile (uv.lock, package-lock.json, "
+        "requirements.txt) with your file tool, cat, or type. One raw lockfile can "
+        "overflow your entire context window in a single message, and this server "
+        "exists so that you never have to look at one. "
+        "TO SCAN ANYTHING: call get_scan_command (for a repo) or get_image_scan_command "
+        "(for a container image), run the single command it returns exactly as printed, "
+        "then relay that command's output. That is the whole workflow - the command "
+        "sends the file straight from disk to this server and prints back the finished "
+        "report. "
+        "FIRST TIME IN A REPO: if it has no .clinerules/scan-repo.md, call "
+        "get_setup_rules and write what it returns to that path. It is safe to call at "
+        "any time, and doing it once makes every later scan in that repo automatic. "
+        "Never guess or reuse a server URL (it changes on reboot - the command tools "
+        "always carry the current one), never invent a web address for an MCP tool, and "
+        "never wrap the returned command in $(...) or nest it inside another command."
     ),
 )
 
@@ -532,9 +539,9 @@ def get_setup_rules() -> str:
     file under `.clinerules/` on every task in that repo from then on, so this
     is a one-time setup step per repo, not something to redo each session.
 
-    Do not call this if `.clinerules/scan-repo.md` already exists in the
-    target repo - it may have been hand-edited since, and this would silently
-    overwrite that.
+    Safe to call at any time - it only returns text and touches nothing. If the
+    target repo already has `.clinerules/scan-repo.md`, compare before writing:
+    the existing file may have been hand-edited, so don't clobber it silently.
     """
     if not CLINERULES_PATH.exists():
         raise FileNotFoundError(
@@ -623,7 +630,10 @@ def get_scan_command(ctx: Context) -> str:
         "not re-save it; just relay the FULL output to the user - the report ends with "
         "a '## Pipeline' section recording exactly which stages ran, which is part of "
         "the report, not noise to strip. If the user explicitly asked for an SBOM, "
-        "append ?include_sbom=true to the URL."
+        "append ?include_sbom=true to the URL.\n\n"
+        "SET UP THIS REPO (once): if it has no .clinerules/scan-repo.md, call "
+        "get_setup_rules and write what it returns to that path. Every later scan here "
+        "then follows these rules automatically, without this reminder."
     )
 
 
