@@ -6,6 +6,57 @@ this repo's dependencies against NVD, CISA KEV, and OSV.dev, and return a
 triaged findings report. You may be running as a small (~7B) local model -
 follow these steps literally, in order, every time.
 
+## Hard rules - read this list first, every time
+
+- `condense_lockfile`, `scan_repo`, `get_setup_rules` are **MCP tools
+  only**. Never a terminal command, script, Python module, or CLI - not
+  even ones that exist as files in this repo (see below for why).
+- **Never write to, edit, or overwrite any file that already exists** in
+  this repo - not the lockfile, not `.clinerules/`, not anything. The only
+  files you ever write are new ones: a report under `reports/`, or an
+  explicitly-requested SBOM file.
+- **Never run `pip install`, `uv sync`, `uv add`,** or any install/setup
+  command to "fix" a tool-not-found error. Nothing needs installing, ever -
+  both tools are already available to you right now.
+- **Never pass a file path, shell command, or `$(...)`/backtick
+  substitution** as `lockfile_content` - only literal text you already read.
+- **Always condense before scanning**: read the lockfile -> call
+  `condense_lockfile` -> call `scan_repo` with what that returned. Never
+  pass the raw lockfile straight into `scan_repo`.
+- **If a tool call fails, read the error and fix what it says.** Never
+  retry the identical call unchanged, and never "work around" a failure by
+  editing a file instead of fixing the call.
+
+Everything below explains *why*, in detail - but if you only carry one
+thing forward, carry this list.
+
+## Never edit, write to, or overwrite the lockfile - or any existing file
+
+This entire workflow is read-only with respect to every file that already
+exists in this repo. You **read** the lockfile (`uv.lock`,
+`package-lock.json`, `requirements.txt`) - you never edit it, rewrite it,
+"condense it in place," truncate it, or touch it with any write/edit tool,
+for any reason, under any circumstance. Condensing a lockfile does not mean
+shrinking the file on disk - it means calling the `condense_lockfile` MCP
+tool with the text you read, entirely in memory; the tool returns a smaller
+string, and the original file on disk is never involved in that at all. If
+any step in this workflow fails, the fix is always to call the right MCP
+tool correctly, never to edit, fix, "clean up," or work around it by
+modifying a source file yourself.
+
+The only files this workflow ever **writes** are new ones: the report
+(`reports/<date>-scan.md` or `.html`, see below), and - only if the user
+explicitly asks to save an SBOM - a dedicated SBOM file such as
+`sbom.cdx.json`, which is a generated artifact safe to create or overwrite
+on each run, same as the report. Nothing else. If you ever find yourself
+about to open a write/edit tool on `uv.lock`, `package-lock.json`,
+`requirements.txt`, `.clinerules/scan-repo.md` (outside the one-time
+`get_setup_rules` bootstrap in a *different* repo), or any other file that
+isn't a new report or an explicitly-requested SBOM file - stop. That is not
+a step in this workflow; something has gone wrong, and the correct recovery
+is to go back to reading the lockfile and calling the MCP tools, not to
+write to anything.
+
 ## `condense_lockfile` and `scan_repo` are MCP tools, not scripts - never run them from a terminal
 
 `condense_lockfile`, `scan_repo`, and `get_setup_rules` exist *only* as

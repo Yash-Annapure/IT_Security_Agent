@@ -82,6 +82,19 @@ def test_scan_repo_rejects_ellipsis_placeholder_with_clear_error():
         mcp_server.scan_repo(lockfile_content="{ ... (lockfile content) ... }")
 
 
+def test_scan_repo_rejects_output_location_description_with_clear_error():
+    # The exact real case this covers: Cline auto-truncates large terminal output to a
+    # log file and shows a summary line in its place - a model paraphrased that summary
+    # ("... (3418 lines written to null) ...") as if it were the lockfile content itself.
+    with pytest.raises(ValueError, match="description of where output was saved"):
+        mcp_server.scan_repo(lockfile_content="... (3418 lines written to null) ...")
+
+
+def test_scan_repo_rejects_bare_file_path_with_clear_error():
+    with pytest.raises(ValueError, match="bare file path"):
+        mcp_server.scan_repo(lockfile_content="reports/condensed_lockfile.txt")
+
+
 def test_condense_lockfile_uv_lock_round_trips_to_the_same_components():
     condensed = mcp_server.condense_lockfile(lockfile_content=UV_LOCK_TEXT)
     assert condensed == "django==2.2.0"

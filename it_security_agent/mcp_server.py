@@ -23,6 +23,7 @@ See README.md for the one-time Mistral (vLLM) setup on the same box.
 import datetime
 import json
 import os
+import re
 import socket
 import time
 from pathlib import Path
@@ -109,15 +110,21 @@ def _detect_lockfile_type(content: str) -> str:
     return "requirements.txt"  # plain text, no structural marker - the fallback guess
 
 
+_BARE_LOCKFILE_PATH = re.compile(r"^[\w./\\:\-]+\.(lock|json|txt)$", re.IGNORECASE)
+
+
 def _placeholder_reason(content: str) -> str | None:
     """Returns a human-readable reason if `content` looks like a caller never actually
     substituted real file content - a shell-substitution string it expected to be
-    expanded, a `{ ... }` stub, an ellipsis - rather than None if it looks like real text.
+    expanded, a `{ ... }` stub, an ellipsis, a bare file path, a description of where
+    output was saved - rather than None if it looks like real text.
 
     This exists because a raw parser error ("Invalid statement (at line 1, column 1)" from
     a TOML parser choking on "$(type uv.lock)") is a cryptic, unhelpful signal for both a
     human and a small model to act on - this turns it into something actionable, and turns
-    a swallowed failure into a real one instead of quietly returning nothing useful.
+    a swallowed failure into a real one instead of quietly returning nothing useful. Each
+    check below traces back to a specific real mistake this project hit in practice, not a
+    hypothetical one - see tests/test_mcp_server.py for the exact case each one covers.
     """
     stripped = content.strip()
     if stripped.startswith("$(") and stripped.endswith(")"):
@@ -128,8 +135,16 @@ def _placeholder_reason(content: str) -> str | None:
         )
     if "`" in stripped and len(stripped) < 200:
         return "looks like a shell command (backticks) rather than real file content"
+    if len(stripped) < 500 and "written to" in stripped.lower():
+        return (
+            "looks like a description of where output was saved (e.g. \"N lines written "
+            "to ...\") rather than the file's actual content - a notice about output being "
+            "saved elsewhere is not the content itself"
+        )
     if len(stripped) < 500 and "..." in stripped:
         return "looks like a placeholder/ellipsis stub rather than real file content"
+    if "\n" not in stripped and _BARE_LOCKFILE_PATH.match(stripped):
+        return "looks like a bare file path, not the file's actual content"
     return None
 
 
