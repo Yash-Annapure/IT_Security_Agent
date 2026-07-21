@@ -345,8 +345,9 @@ def _flagging_policy(meta: dict) -> list:
         "- **escalated** - on CISA's Known Exploited Vulnerabilities list; exploited in the wild.",
         "- **confirmed** - confidence cleared the threshold, *or* OSV.dev agrees for this "
         "version, AND the CPE vendor isn't one the package's registry page contradicts.",
-        "- **review_queue** - below threshold and uncorroborated. Undecided, not dismissed; "
-        "carries SHAP values showing which signals moved the score.",
+        "- **review_queue** - either below threshold and uncorroborated, or confident but "
+        "matched to a CPE vendor the package's own registry page contradicts. Undecided, "
+        "not dismissed; carries SHAP values showing which signals moved the score.",
         "- **rejected** - name matched but the pinned version isn't affected, or no plausible "
         "vendor. The name-collision case (PyPI `babel` vs Babel.js).",
     ]
@@ -380,9 +381,11 @@ def format_summary(result, meta: dict) -> str:
         lines += [_detail_block(f) for f in result.confirmed]
     if result.review_queue:
         lines += ["", "## Needs human review",
-                  "_The model wasn't confident enough to call these either way - a person "
-                  "should look. The 'why the model hesitated' factors are SHAP values: how "
-                  "much each signal pushed the score up (+) or down (-)._"]
+                  "_Held back for a person to decide, for one of two reasons: the model "
+                  "wasn't confident enough either way, or it was confident but matched a "
+                  "CPE vendor this package's registry page contradicts (a likely name "
+                  "collision). Each finding's **Note** says which. The SHAP factors show "
+                  "how much each signal pushed the score up (+) or down (-)._"]
         lines += [_detail_block(f) for f in result.review_queue]
     return "\n".join(lines)
 
@@ -430,8 +433,16 @@ def _detail_block(f) -> str:
         "",
         f"**What this means:** {_severity_in_plain_terms(f)}",
         "",
-        f"**Fix:** upgrade `{c.name}` to a version newer than {c.version}, or apply the "
-        f"vendor's patch - check the NVD link below for the fixed version range.",
+        # Remediation advice is only safe once the finding is known to be about this
+        # package. For a suspected collision, "upgrade past X" points at the wrong
+        # software entirely - the fix, if any, belongs to whoever owns the other product.
+        (f"**Fix:** check first whether this CVE is about `{c.name}` at all - the CPE "
+         f"vendor doesn't match this package's registry page, so it may describe a "
+         f"different product with the same name. Only if it does apply: upgrade "
+         f"`{c.name}` past {c.version}."
+         if f.vendor_conflict else
+         f"**Fix:** upgrade `{c.name}` to a version newer than {c.version}, or apply the "
+         f"vendor's patch - check the NVD link below for the fixed version range."),
         "",
     ]
 
@@ -466,8 +477,12 @@ def _detail_block(f) -> str:
 
     if f.explanation:
         top = sorted(f.explanation.items(), key=lambda kv: -abs(kv[1]))[:3]
-        out += ["", "**Why the model hesitated (top SHAP factors):** "
-                + ", ".join(f"`{k}` {v:+.2f}" for k, v in top)]
+        # A finding the vendor gate demoted didn't hesitate - it scored above the
+        # threshold and was held back on separate evidence. Labelling its SHAP values
+        # "why the model hesitated" would misdescribe both the score and the decision.
+        label = ("**What drove the model's score (top SHAP factors):**" if f.model_confident
+                 else "**Why the model hesitated (top SHAP factors):**")
+        out += ["", label + " " + ", ".join(f"`{k}` {v:+.2f}" for k, v in top)]
     return "\n".join(out)
 
 

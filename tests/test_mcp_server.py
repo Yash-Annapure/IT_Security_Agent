@@ -660,6 +660,36 @@ def test_findings_on_a_thin_cache_are_marked_a_lower_bound():
     assert "not a clean bill of health" not in text  # findings exist; the caveat differs
 
 
+def test_a_suspected_collision_does_not_get_remediation_advice():
+    # "upgrade click past 8.4.2" to fix an Ubuntu-phone CVE points at the wrong software.
+    f = _finding(cve="CVE-2015-8768")
+    f.vendor_conflict = True
+    text = mcp_server.format_summary(ScanResult(review_queue=[f]), _meta(FULL_CACHE))
+    assert "check first whether this CVE is about" in text
+    assert "**Fix:** upgrade" not in text
+
+
+def test_a_gate_demoted_finding_is_not_described_as_hesitation():
+    # The vendor gate demotes findings the model scored *above* threshold, so labelling
+    # their SHAP values "why the model hesitated" would misdescribe the decision.
+    f = _finding(cve="CVE-X", explanation={"name_similarity": 0.46})
+    f.model_confident, f.vendor_conflict = True, True
+    text = mcp_server.format_summary(ScanResult(review_queue=[f]), _meta(FULL_CACHE))
+    assert "What drove the model's score" in text
+    assert "Why the model hesitated" not in text
+
+    unsure = _finding(cve="CVE-Y", explanation={"name_similarity": 0.1})
+    unsure.model_confident = False
+    text = mcp_server.format_summary(ScanResult(review_queue=[unsure]), _meta(FULL_CACHE))
+    assert "Why the model hesitated" in text
+
+
+def test_review_queue_blurb_covers_both_reasons_a_finding_lands_there():
+    text = mcp_server.format_summary(ScanResult(review_queue=[_finding()]), _meta(FULL_CACHE))
+    assert "wasn't confident enough" in text
+    assert "likely name collision" in text
+
+
 def test_format_summary_states_the_flagging_policy():
     text = mcp_server.format_summary(ScanResult(confirmed=[_finding()]), _meta(
         FULL_CACHE, model={"name": "random_forest", "threshold": 0.15,

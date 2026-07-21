@@ -10,6 +10,7 @@ def _finding_to_dict(f):
         "cve": f.cve, "severity": f.severity, "cvss_score": f.cvss_score,
         "confidence": f.confidence, "corroboration": f.corroboration, "kev_hit": f.kev_hit,
         "model_confident": f.model_confident, "note": f.note, "explanation": f.explanation,
+        "vendor_conflict": getattr(f, "vendor_conflict", False),
         # What the vulnerability actually is - carried through from the NVD record so
         # consumers of the JSON/HTML report don't have to re-query NVD to explain it.
         "description": getattr(f, "description", ""),

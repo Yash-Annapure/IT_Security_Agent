@@ -19,6 +19,10 @@ class Finding:
     kev_hit: bool = False
     note: str = ""
     model_confident: bool = False
+    # True when the CVE's CPE vendor is contradicted by the package's own registry page,
+    # i.e. this is probably a different product that shares the name. Reports use it to
+    # avoid handing out remediation advice for a vulnerability that isn't this package's.
+    vendor_conflict: bool = False
     # Carried through from matching.find_candidates so reports can explain what the
     # vulnerability actually *is*, not just cite its ID. matching already extracts
     # both from the NVD record; dropping them here would mean re-querying to report.
@@ -114,6 +118,7 @@ def triage_component(component, winning_model_name, winning_model, threshold, ex
 
         trusted = finding_data.get("registry_trusted_vendors") or frozenset()
         vendor_conflict = bool(trusted) and finding_data.get("vendor") not in trusted
+        f.vendor_conflict = vendor_conflict
         model_says_yes = confidence >= threshold or corroboration == "osv_agrees"
 
         if model_says_yes and (kev_hit or not vendor_conflict):
