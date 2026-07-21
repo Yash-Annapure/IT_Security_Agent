@@ -4,6 +4,7 @@
     uv run warm_cache.py --days=45        # ~95% CVE coverage, ~35-45 min - do this once
     uv run warm_cache.py path/to/uv.lock path/to/package-lock.json
     uv run warm_cache.py --full           # all ~368k CVEs; --days=45 gets ~95% for less
+    uv run warm_cache.py --full --workers=6   # more concurrency; 4 (with an API key) by default
 
 Everything lands in `nvd_cache.db` (SQLite, repo root - the same file the server reads),
 so this is a one-time cost per machine rather than a per-scan one. Run it once after
@@ -28,11 +29,12 @@ import datetime
 import os
 import sys
 import time
+from functools import partial
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-from it_security_agent import cpe_dictionary, kev, nvd_cache
+from it_security_agent import cpe_dictionary, kev, nvd_cache, nvd_client
 from it_security_agent.mcp_server import parse_lockfile_components
 
 load_dotenv()
@@ -97,8 +99,12 @@ def _collect_names(paths: list[Path]) -> list[str]:
 def _sync_reporter(started_at: float):
     """Progress callback for NVD paging: shows position, rate and a live ETA.
 
-    NVD pages 2000 CVEs at a time, so even a 90-day window is dozens of sequential
-    requests and a full sync is ~185. Without this the command looks hung.
+    NVD pages 2000 CVEs at a time, so even a 90-day window is dozens of requests and a
+    full sync is ~185. Without this the command looks hung.
+
+    The counter is pages *completed*, not position in the catalog: pages are fetched
+    concurrently and land out of order, so it says how much work is done rather than
+    where in the sequence we are.
     """
     state = {"last": 0.0, "page": 0}
 
@@ -153,10 +159,14 @@ def main():
     flags = [a for a in sys.argv[1:] if a.startswith("--")]
     full = "--full" in flags
     days = DEFAULT_DAYS
+    workers = nvd_client.DEFAULT_WORKERS
     for flag in flags:
         if flag.startswith("--days"):
             _, _, value = flag.partition("=")
             days = int(value) if value else DEFAULT_DAYS
+        if flag.startswith("--workers"):
+            _, _, value = flag.partition("=")
+            workers = max(1, int(value)) if value else workers
 
     paths = [Path(a) for a in args] or [Path(n) for n in DEFAULT_LOCKFILES if Path(n).exists()]
     if not paths:
@@ -177,21 +187,24 @@ def main():
         sys.exit(1)
     print(f"  -> {len(names)} unique package names to look up", flush=True)
 
+    fetch_fn = partial(nvd_client.fetch_all_pages_parallel, workers=workers)
     if full:
         print("\nSyncing NVD's ENTIRE CVE catalog...", flush=True)
-        print("  NOTE: ~370,000 CVEs over ~185 sequential requests - expect "
-              f"{'10-20' if NVD_API_KEY else '30-45'} minutes"
+        print(f"  NOTE: ~370,000 CVEs over ~185 requests, {workers} at a time - expect "
+              f"{'8-15' if NVD_API_KEY else '20-30'} minutes"
               f"{'' if NVD_API_KEY else ' (no NVD_API_KEY - set one to cut this ~6x)'}.",
               flush=True)
         print("  Ctrl-C and re-run without --full if you'd rather not wait; --days covers "
               "recently-changed CVEs, which is what matching mostly relies on.\n", flush=True)
-        count = nvd_cache.sync_full(conn=conn, on_progress=_sync_reporter(time.time()))
+        count = nvd_cache.sync_full(conn=conn, fetch_fn=fetch_fn,
+                                    on_progress=_sync_reporter(time.time()))
     else:
-        print(f"\nSyncing NVD CVEs modified in the last {days} days...", flush=True)
+        print(f"\nSyncing NVD CVEs modified in the last {days} days ({workers} workers)...", flush=True)
         print("  (this is a coverage setting: matching can only find CVEs that are in "
               "this cache - widen it with --days if scans look suspiciously clean)\n", flush=True)
         since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
-        count = nvd_cache.sync_incremental(since=since, conn=conn, on_progress=_sync_reporter(time.time()))
+        count = nvd_cache.sync_incremental(since=since, conn=conn, fetch_fn=fetch_fn,
+                                           on_progress=_sync_reporter(time.time()))
     print(f"  -> stored/updated {count:,} CVEs", flush=True)
     if not full and days < 45:
         print("  Coverage note: NVD holds ~368,000 CVEs in total. A window this small "
