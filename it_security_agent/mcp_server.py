@@ -53,6 +53,30 @@ CLINERULES_PATH = Path(__file__).resolve().parent.parent / ".clinerules" / "scan
 MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8765"))
 
+# Tools taking raw file content are hidden from the tool list by default.
+#
+# This is the fix for the failure mode that kept overflowing small models: asked to
+# "scan for vulnerabilities", a model picks the most on-the-nose tool it can see. With
+# scan_repo(lockfile_content=...) advertised, that tool's own schema tells it a lockfile
+# must be read into context first - which is precisely what blows a 32K window on a
+# 300KB package-lock.json. Prose in `instructions` cannot outrank a required parameter
+# named `lockfile_content`; removing the parameter from view can.
+#
+# What remains is a tool list where every entry is safe: the command tools return a
+# command, and the file itself travels disk -> curl -> /scan without passing through the
+# model at all. Set EXPOSE_CONTENT_TOOLS=1 to advertise them again (useful with a
+# large-context model, or to demo the direct-call path).
+EXPOSE_CONTENT_TOOLS = os.environ.get("EXPOSE_CONTENT_TOOLS", "").lower() in ("1", "true", "yes")
+
+
+def content_tool(fn):
+    """Register `fn` as an MCP tool only when content-taking tools are opted in.
+
+    Always returns the plain function, so the HTTP routes, the notebook and the tests
+    keep calling it exactly as before - only its visibility in the tool list changes.
+    """
+    return mcp.tool()(fn) if EXPOSE_CONTENT_TOOLS else fn
+
 # `instructions` is server-wide guidance some MCP clients (Cline included) surface
 # alongside the tool list, independent of any single tool's own docstring - the one
 # place that's guaranteed visible in a brand-new repo that has no .clinerules/ yet,
@@ -61,22 +85,29 @@ mcp = FastMCP(
     "it-security-agent",
     host=MCP_HOST,
     port=MCP_PORT,
+    # Order matters more than completeness here. This text is the only guidance
+    # guaranteed to reach a model in a repo that has no .clinerules/ yet, and it is read
+    # by small local models. An earlier version opened with the conditional bootstrap
+    # procedure, so the first concrete instruction a model met was "check with your own
+    # file tool" - it reached for the file tool, read package-lock.json, and overflowed
+    # its context before ever calling a tool here. The prohibition whose violation is
+    # fatal now comes first, the single action second, and the bootstrap last.
     instructions=(
-        "Before your first scan_repo call in any given repo, check locally (with "
-        "your own file tool) whether that repo already has a .clinerules/scan-repo.md "
-        "file. If it doesn't, call get_setup_rules once, write its returned text "
-        "verbatim to .clinerules/scan-repo.md at that repo's root, then proceed. "
-        "This is a one-time per-repo bootstrap - never call get_setup_rules if that "
-        "file already exists, and never repeat this check more than once per repo. "
-        "NEVER read or open a raw lockfile (uv.lock, package-lock.json, "
-        "requirements.txt) with your file tool or print it with type/cat - raw "
-        "lockfiles are often large enough to overflow your entire context window in "
-        "one message. The whole scan is three trivial actions: (1) call the "
-        "get_scan_command tool, (2) run the single command it returns, exactly as "
-        "printed, (3) save that command's printed output as the report. Never guess "
-        "or reuse a server URL (it changes on reboot - get_scan_command always has "
-        "the current one), never invent a web address for any MCP tool, and never "
-        "wrap the command in $(...) or nest it inside another command."
+        "NEVER read, open, or print a lockfile (uv.lock, package-lock.json, "
+        "requirements.txt) with your file tool, cat, or type. One raw lockfile can "
+        "overflow your entire context window in a single message, and this server "
+        "exists so that you never have to look at one. "
+        "TO SCAN ANYTHING: call get_scan_command (for a repo) or get_image_scan_command "
+        "(for a container image), run the single command it returns exactly as printed, "
+        "then relay that command's output. That is the whole workflow - the command "
+        "sends the file straight from disk to this server and prints back the finished "
+        "report. "
+        "FIRST TIME IN A REPO: if it has no .clinerules/scan-repo.md, call "
+        "get_setup_rules and write what it returns to that path. It is safe to call at "
+        "any time, and doing it once makes every later scan in that repo automatic. "
+        "Never guess or reuse a server URL (it changes on reboot - the command tools "
+        "always carry the current one), never invent a web address for an MCP tool, and "
+        "never wrap the returned command in $(...) or nest it inside another command."
     ),
 )
 
@@ -532,9 +563,9 @@ def get_setup_rules() -> str:
     file under `.clinerules/` on every task in that repo from then on, so this
     is a one-time setup step per repo, not something to redo each session.
 
-    Do not call this if `.clinerules/scan-repo.md` already exists in the
-    target repo - it may have been hand-edited since, and this would silently
-    overwrite that.
+    Safe to call at any time - it only returns text and touches nothing. If the
+    target repo already has `.clinerules/scan-repo.md`, compare before writing:
+    the existing file may have been hand-edited, so don't clobber it silently.
     """
     if not CLINERULES_PATH.exists():
         raise FileNotFoundError(
@@ -623,7 +654,10 @@ def get_scan_command(ctx: Context) -> str:
         "not re-save it; just relay the FULL output to the user - the report ends with "
         "a '## Pipeline' section recording exactly which stages ran, which is part of "
         "the report, not noise to strip. If the user explicitly asked for an SBOM, "
-        "append ?include_sbom=true to the URL."
+        "append ?include_sbom=true to the URL.\n\n"
+        "SET UP THIS REPO (once): if it has no .clinerules/scan-repo.md, call "
+        "get_setup_rules and write what it returns to that path. Every later scan here "
+        "then follows these rules automatically, without this reminder."
     )
 
 
@@ -632,8 +666,16 @@ def _condense(lockfile_content: str, lockfile_type: str = "") -> str:
     if not components:
         raise ValueError("No components could be parsed from the provided lockfile - nothing to condense.")
     if all(c.ecosystem == "npm" for c in components):
-        packages = {f"node_modules/{c.name}": {"version": c.version} for c in components}
-        return json.dumps({"packages": packages})
+        # Stays JSON, unlike the flat PyPI form below, because that form round-trips
+        # through _detect_lockfile_type as requirements.txt - npm packages would come
+        # back as PyPI and be matched against the wrong ecosystem entirely.
+        #
+        # The bulk is trimmed instead: parse_package_lock_text splits on "node_modules/"
+        # and takes the last segment, so a bare name re-parses identically, and compact
+        # separators drop the spaces json.dumps adds by default. ~30% smaller, which on
+        # a real 1500-package lock is thousands of tokens of a small model's context.
+        packages = {c.name: {"version": c.version} for c in components}
+        return json.dumps({"packages": packages}, separators=(",", ":"))
     pypi_lines = [f"{c.name}=={c.version}" for c in components if c.ecosystem == "PyPI"]
     return "\n".join(pypi_lines)
 
@@ -666,7 +708,7 @@ async def condense_http_endpoint(request):
         return PlainTextResponse(str(exc), status_code=400)
 
 
-@mcp.tool()
+@content_tool
 def condense_lockfile(
     lockfile_content: Annotated[str, Field(description=(
         "The literal text of a uv.lock, package-lock.json, or requirements.txt file - "
@@ -722,7 +764,7 @@ def condense_lockfile(
     return _condense(lockfile_content, lockfile_type)
 
 
-@mcp.tool()
+@content_tool
 def scan_repo(
     lockfile_content: Annotated[str, Field(description=(
         "The literal text of a uv.lock, package-lock.json, or requirements.txt file - "

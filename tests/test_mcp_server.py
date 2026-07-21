@@ -110,6 +110,30 @@ def test_condense_lockfile_package_lock_round_trips_to_the_same_components():
         {(c.name, c.version, c.ecosystem) for c in original}
 
 
+def test_condense_npm_stays_json_so_the_ecosystem_survives_the_round_trip():
+    # A flat "react==18.2.0" list would be re-detected as requirements.txt and the
+    # packages scanned as PyPI - silently matching npm names against Python CVEs.
+    condensed = mcp_server.condense_lockfile(lockfile_content=json.dumps({
+        "lockfileVersion": 3, "packages": {
+            "": {"name": "app"},
+            "node_modules/react": {"version": "18.2.0"},
+            "node_modules/@babel/core": {"version": "7.0.0"}}}))
+    components = mcp_server.parse_lockfile_components(condensed)
+    assert {(c.name, c.version, c.ecosystem) for c in components} == {
+        ("react", "18.2.0", "npm"), ("@babel/core", "7.0.0", "npm")}
+
+
+def test_condense_npm_drops_the_node_modules_prefix_and_whitespace():
+    # Both are re-derived on parse, so carrying them costs a small model context for
+    # nothing - parse_package_lock_text splits on "node_modules/" and takes the last part.
+    condensed = mcp_server.condense_lockfile(lockfile_content=json.dumps({
+        "lockfileVersion": 3, "packages": {
+            "": {"name": "app"}, "node_modules/react": {"version": "18.2.0"}}}))
+    assert "node_modules/" not in condensed
+    assert ", " not in condensed and '": ' not in condensed  # compact separators
+    assert condensed == '{"packages":{"react":{"version":"18.2.0"}}}'
+
+
 def test_condense_lockfile_is_dramatically_smaller_than_the_original():
     condensed = mcp_server.condense_lockfile(lockfile_content=UV_LOCK_TEXT)
     assert len(condensed) < len(UV_LOCK_TEXT)
