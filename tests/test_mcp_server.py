@@ -139,6 +139,40 @@ def test_condense_lockfile_is_dramatically_smaller_than_the_original():
     assert len(condensed) < len(UV_LOCK_TEXT)
 
 
+def test_package_json_is_rejected_with_the_reason_not_just_zero_components():
+    # package.json is JSON, so _detect_lockfile_type calls it package-lock.json and the
+    # npm parser finds no `packages` key. "No components parsed" is true but doesn't say
+    # that ranges can't be version-matched, or which file to send instead.
+    text = json.dumps({"name": "demo", "dependencies": {"lodash": "^4.17.15"}})
+    assert mcp_server.parse_lockfile_components(text) == []
+    reason = mcp_server._unsupported_input_reason(text)
+    assert "package.json, not package-lock.json" in reason
+    assert "ranges" in reason
+
+
+def test_an_sbom_is_rejected_with_the_reason_it_is_refused():
+    text = json.dumps({"bomFormat": "CycloneDX", "specVersion": "1.5", "components": []})
+    reason = mcp_server._unsupported_input_reason(text)
+    assert "never accepts one as input" in reason
+    assert "unverifiable" in reason
+    assert "SBOM" in mcp_server._unsupported_input_reason(
+        json.dumps({"spdxVersion": "SPDX-2.3", "packages": []}))
+
+
+def test_a_real_package_lock_is_not_flagged_as_unsupported():
+    text = json.dumps({"lockfileVersion": 3, "packages": {
+        "": {"name": "demo"}, "node_modules/lodash": {"version": "4.17.15"}}})
+    assert mcp_server._unsupported_input_reason(text) is None
+    components = mcp_server.parse_lockfile_components(text)
+    assert [(c.name, c.version, c.ecosystem) for c in components] == [("lodash", "4.17.15", "npm")]
+
+
+def test_unsupported_reason_ignores_non_json_lockfiles():
+    assert mcp_server._unsupported_input_reason(UV_LOCK_TEXT) is None
+    assert mcp_server._unsupported_input_reason("django==2.2.0") is None
+    assert mcp_server._unsupported_input_reason("{not valid json") is None
+
+
 def test_condense_lockfile_requires_lockfile_content():
     with pytest.raises(ValueError, match="No lockfile content provided"):
         mcp_server.condense_lockfile()

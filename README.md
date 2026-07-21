@@ -7,8 +7,10 @@ triages each match into `escalated` / `confirmed` / `review_queue` /
 
 Three ways to feed it dependencies, as a Python library:
 - **A lockfile** - `uv.lock`, `package-lock.json`, or `requirements.txt` via `repo_scan.py`.
+  This is the only input the MCP server accepts, and the only one exercised end-to-end.
 - **A container image** - `image_scan.scan_image()`, generates a fresh SBOM by
-  running Syft against the actual image.
+  running Syft against the actual image. Library-only: not exposed through the
+  server, and tested against a mocked Syft rather than a live one.
 - **An existing SBOM** (CycloneDX or SPDX) - `sbom.parse_cyclonedx` / `parse_spdx`.
   This one is for parsing output your own tooling just produced (e.g. Syft's,
   or `generate_sbom.py`'s own), not for trusting an arbitrary file someone
@@ -18,6 +20,29 @@ Given a lockfile but no SBOM, this project can also *generate* a real
 CycloneDX SBOM itself, with no external tool - `generate_sbom.generate_sbom(repo_dir)`
 (Section 10 of the notebook demonstrates it end-to-end: generate -> round-trip
 through the same parser a third-party SBOM would use -> scan).
+
+## Why this one
+
+| | How | Where |
+|---|---|---|
+| **A clean result means something** | Every report says how much of NVD it searched. On a thin cache, "nothing found" is explicitly *not* allowed to read as "you're clean" - most scanners print `0 findings` identically whether they searched 100% or 11%. | `_cache_coverage`, `_coverage_caveat` |
+| **Name collisions get caught** | A package's registry homepage identifies its real vendor; a CVE matching a *different* vendor drops to review. Took `confirmed` precision from 1-in-5 to 1-in-1 on this repo. | `normalize`, `matching`, `agent` |
+| **Nothing silently dropped** | A miss is weighted 10x a false alarm, and that picks both the model and its cutoff. Worst case for an uncertain finding is a human looks at it. | `model._best_threshold` |
+| **Uncertainty is explained** | SHAP values on exactly the findings a person must judge - which signal moved the score, and how far. | `explain.py` |
+| **~3.5s, fully offline** | Indexed product lookups instead of full-table text search, batched scoring, KEV held in memory. 158 deps vs ~368,000 CVEs. | `nvd_cache.cve_products`, `predict_confidence_batch` |
+| **Runs on a small local model** | Lockfiles never enter the model's context - disk -> `curl` -> server. This repo's own is 618KB, ~4x a 32K window. | `POST /scan`, `get_scan_command` |
+| **Input can't be doctored** | Lockfile only; the SBOM is always rebuilt server-side. A supplied SBOM is a claim, and a claim can omit a vulnerable package. | `sbom.to_cyclonedx` |
+| **Two independent sources** | OSV.dev queried separately - can confirm a match the model doubted, or flag one it was sure about. | `osv.py` |
+| **Drops into any repo** | The rules file is served by the tool that installs it, so the two copies never drift. | `get_setup_rules` |
+| **Reproducible** | 223 tests, ~94% coverage, every external call mocked - never touches a live API. | `tests/` |
+
+The whole workflow, once set up:
+
+```
+ask Cline "check this repo"
+   └─ get_scan_command  ->  curl --data-binary @uv.lock  ->  POST /scan  ->  report
+                            (file goes disk -> HTTP, never through the model)
+```
 
 **Tamper-proofing:** the MCP server (below) only ever accepts a lockfile, never
 a pre-made SBOM. A caller-supplied SBOM is an unverified claim about what's
@@ -127,7 +152,7 @@ Paste into Cline -> "Configure MCP Servers" (merge into an existing
       "type": "streamableHttp",
       "url": "http://192.168.1.42:8765/mcp",
       "timeout": 300,
-      "autoApprove": ["get_scan_command", "condense_lockfile", "scan_repo"]
+      "autoApprove": ["get_scan_command", "get_setup_rules"]
     }
   }
 }
@@ -186,9 +211,12 @@ one message on a real dependency tree.
 
 **Tool** - "Configure MCP Servers" -> paste the JSON block `serve.py` printed.
 
-The 300s timeout in that block matters: the first `scan_repo` call after the
-server starts does a full NVD sync and can take 1-2 minutes. Cline's default
-timeout is much shorter and will otherwise report a false failure.
+The 300s timeout in that block matters: the first scan after the server starts
+may sync NVD before it can answer, which takes 1-2 minutes. Cline's default
+timeout is much shorter and will otherwise report a false failure. (A cache
+warmed with `warm_cache.py --full` skips the sync entirely - the server reports
+"Cache is complete - scanning offline, no NVD sync needed" and never reaches
+for the network.)
 
 ### Use it
 
@@ -232,6 +260,19 @@ The CWE translations live in `it_security_agent/cwe.py` (the CWE Top 25 plus
 common library-level flaws); an unmapped ID degrades to the bare identifier
 and its MITRE link rather than breaking the report.
 
+Every report also opens with a plain verdict - vulnerabilities found or not -
+and states **how much of NVD it actually searched**. That second part matters
+more than it sounds: matching can only find CVEs that are in the local cache,
+so a half-finished sync produces a reassuringly empty report rather than an
+error. On a thin cache an empty result is explicitly labelled *"not a clean
+bill of health"* rather than being allowed to read as one.
+
+A finding is only `confirmed` if the CPE vendor isn't contradicted by the
+package's own registry homepage. On this repo that rule moved four name
+collisions (`babel` vs Babel.js, `click` vs Ubuntu's Click, `jupyter` twice
+vs VS Code) out of `confirmed` and into `review_queue`, without demoting the
+one genuine finding - nothing is dropped, it just gets a human's eyes.
+
 If you ask for "an SBOM," the model appends `?include_sbom=true` to the
 scan URL and a real CycloneDX document (not a description of one) comes
 back inline with the findings. There is no way to pass in a pre-made SBOM,
@@ -272,15 +313,27 @@ the live hostname in its `Host` header (and the original scheme in
 being handled. `.clinerules/` tells the model to always ask that tool
 rather than guessing, remembering, or fabricating a URL.
 
+**The tool list enforces this, not just the prompt.** `scan_repo` and
+`condense_lockfile` take lockfile *content* as a parameter, and that turned
+out to be the whole problem: asked to scan for vulnerabilities, a model picks
+the most on-the-nose tool it can see, and a required parameter named
+`lockfile_content` tells it to go read the file. It did exactly that,
+repeatedly, and overflowed its context before ever calling the server - no
+amount of instruction text outranks a schema. So both tools are now **hidden
+from the tool list by default**, leaving only `get_scan_command` and
+`get_setup_rules`, neither of which takes any argument at all. There is no
+longer a tool a model *could* use to justify reading a lockfile. Set
+`EXPOSE_CONTENT_TOOLS=1` to advertise them again (useful with a large-context
+model, or to demo the direct-call path); both remain importable as ordinary
+Python functions either way.
+
 Secondary paths, for completeness: `POST /condense` returns just the
 condensed `name==version` list (~99.5% smaller than the raw file - 618KB ->
-3KB on this repo's own lockfile) without scanning; the `scan_repo` and
-`condense_lockfile` MCP tools accept lockfile *content* for the rare case
-it's already legitimately in-context; `condense_lockfile.py` (repo root) is
-a thin CLI wrapper for use outside Cline; and `serve_mistral.py` rejects
-any prompt over `MAX_INPUT_TOKENS` (default 28000) with a clear HTTP 413
-before `model.generate()`, so an oversized prompt fails cleanly instead of
-crashing the server.
+3KB on this repo's own lockfile) without scanning; `condense_lockfile.py`
+(repo root) is a thin CLI wrapper for use outside Cline; and
+`serve_mistral.py` rejects any prompt over `MAX_INPUT_TOKENS` (default 28000)
+with a clear HTTP 413 before `model.generate()`, so an oversized prompt fails
+cleanly instead of crashing the server.
 
 ### Using it against a different repo for the first time
 
@@ -292,10 +345,22 @@ lockfile-first workflow, the "no pre-made SBOM" rule, etc.
 
 A second tool, `get_setup_rules`, closes that gap: the server-wide MCP
 `instructions` field (sent to the client alongside the tool list, so it's
-visible even in a repo with no `.clinerules/` at all) tells the model to
-check locally for `.clinerules/scan-repo.md` before its first scan in any
-repo, and if missing, call `get_setup_rules` and write the returned text
-there verbatim - a one-time per-repo bootstrap. The text it returns is read
-straight from this repo's own `.clinerules/scan-repo.md`, so the two never
-drift - edit that one file and both this project's Cline setup and every
-newly-bootstrapped repo pick up the change.
+visible even in a repo with no `.clinerules/` at all) tells the model that if
+the repo has no `.clinerules/scan-repo.md`, it should call `get_setup_rules`
+and write the returned text there - a one-time per-repo bootstrap, after
+which every later scan in that repo follows the rules automatically. The same
+reminder is appended to `get_scan_command`'s output, which is where a model
+reliably reads it: by then it is already holding a command it intends to run,
+rather than skimming server metadata.
+
+The text it returns is read straight from this repo's own
+`.clinerules/scan-repo.md`, so the two never drift - edit that one file and
+both this project's Cline setup and every newly-bootstrapped repo pick up the
+change.
+
+Order matters in that `instructions` text, and getting it wrong was a real
+bug. An earlier version opened with the bootstrap procedure, so the first
+concrete instruction a model met was *"check locally with your own file
+tool"* - it reached for the file tool, read `package-lock.json`, and blew its
+context before reaching the sentence forbidding exactly that. The prohibition
+now comes first, the single action second, the bootstrap last.

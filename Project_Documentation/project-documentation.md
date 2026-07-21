@@ -1,102 +1,255 @@
 # Project documentation: IT Security Agent
 
-This is the full record of the project: what got built, in what order, and why each decision was made the way it was. The [README](../README.md) is the setup guide and the [walkthrough](walkthrough.md) is a plain-language tour of the pipeline; this document is the history and the reasoning behind it, including the parts that didn't work on the first try.
+What this project is, how it is put together, and why it was built this way. The
+[README](../README.md) covers setup; this document covers the design and the reasoning,
+including the parts that were wrong the first time.
 
-## What this project is
+## What it does, in one paragraph
 
-The agent reads a project's dependencies, whatever form they show up in, and checks them against public vulnerability sources (NVD, CISA's actively-exploited list, OSV.dev), then sorts what it finds by how confident it actually is, rather than handing back a flat list of name matches. The hard part was never the lookup itself, it was that dependency files identify packages by purl and vulnerability databases identify software by CPE, a vendor and product string, and nothing guarantees those line up. Most of the project's design exists to handle that gap honestly instead of papering over it.
+You point it at a project. It reads the list of libraries that project depends on, checks
+each one against public records of known security flaws, and hands back a report sorted by
+how sure it actually is. The important word is *sure*: it does not dump every name match on
+you and call them all vulnerabilities. It separates the ones it can stand behind from the
+ones a person needs to look at, and it says why for each.
 
-## Timeline: what got built, and in what order
+## The problem it exists to solve
 
-### Week 1: understanding the problem before building anything
+Two different worlds describe the same software using two different naming systems, and
+nobody made them agree.
 
-The first week was entirely analysis, no scanning code yet. It pulled data live from the NVD REST API 2.0, sketched a multi-week architecture, and did an EU regulatory pass (the Cyber Resilience Act, NIS2, GDPR, and the EU AI Act) to see what a tool like this would actually be obligated to do in production.
+- **Your project** names a library the way its package registry does: `requests`, version
+  `2.19.1`, from PyPI. This is a *purl* — a package URL.
+- **Vulnerability databases** name software by vendor and product: vendor `python`, product
+  `requests`. This is a *CPE* — a Common Platform Enumeration entry, typed in by a human.
 
-The finding that shaped everything after it: across a full, correctly paginated 90-day NVD pull, only about 52.6% of CVEs carry a structured, machine-matchable CPE entry at all, and that coverage varies a lot by ecosystem, around 17% for Debian and Alpine packages, up to 61% for PyPI. That's the reason this project never became a pure CPE-lookup tool. A hybrid approach, CPE matching plus independent cross-checks like OSV, was the only way to get reasonable coverage.
+Nothing links the two. So "does my `requests` have a known flaw?" becomes "which of NVD's
+vendor/product strings, if any, is the same software as this package?" — a guess.
 
-### Week 2: a working matching engine, and the first classifier
+Guessing wrong goes badly in both directions:
 
-Week 2 built the first real matching engine: wildcard-vendor CVE queries against NVD, checked locally against version ranges, run against this project's own `uv.lock` plus 16 fixture packages with known vulnerabilities. On top of that sat a baseline logistic regression classifier meant to tell a real vendor match from a coincidental one, trained on 28 pairs labeled by hand from the scan's own false positives.
+- **Miss a match** and you ship a known vulnerability believing you are clean.
+- **Match the wrong thing** and you get a *name collision*: the Python package `click` shares
+  its name with Ubuntu's Click package manager, so a phone-OS flaw gets reported as a critical
+  issue in your web app. Real example from this project's own scans.
 
-Two analyses came out of that baseline, and both mattered later. The risk analysis framed the cost of a missed vulnerability against the cost of a wasted review, and the finding was blunt: the classifier beat a naive "trust every match" baseline on plain accuracy, but lost on a false-negative-weighted risk score, because it introduced misses the naive approach never had. The conclusion carried straight into Week 3's design: a model like this should flag uncertain matches for a human, not silently filter them. The fairness analysis split model error rates by ecosystem (PyPI versus npm) as a first check on whether the model treated one ecosystem worse than another.
+Week 1's analysis set the ceiling on how well this can ever work: across a full 90-day NVD
+pull, only about **52.6%** of CVEs carry a machine-matchable CPE entry at all — around 17% for
+Debian and Alpine packages, up to 61% for PyPI. That is why this was never built as a pure
+lookup tool. Nearly every design decision below exists to handle that gap honestly rather than
+paper over it.
 
-### Week 3: turning the prototype into an actual pipeline
+## Architecture
 
-Week 3 moved everything out of notebook-only code into a real package, `it_security_agent/`, and wired it into one pipeline: input parsing, a local NVD cache, vendor resolution, model training, explainability, triage, and reporting. The main changes from Week 2:
+### The flow
 
-- Three input paths instead of one hardcoded file: an existing SBOM (CycloneDX or SPDX), a container image via Syft, or the repo's own lockfile (`uv.lock`, `package-lock.json`, later also `requirements.txt`).
-- A local SQLite cache of the NVD catalog, synced once, so a scan never makes a live NVD call per package the way Week 2 did.
-- A real CPE Dictionary lookup and vendor-resolution step (`normalize.py`), replacing Week 2's ad hoc keyword scoring.
-- Automatic training labels instead of hand-labeled pairs: a vendor candidate counts as a real match if its CPE entry's reference URL shares a domain with the package's actual registry homepage. That signal became the label, and specifically never became a model feature, so the model can't just learn to reproduce the rule that generated its own answer key.
-- Two models trained and compared, logistic regression and a random forest, scored on the same false-negative-weighted risk metric Week 2 introduced, with only the winner persisted.
-- SHAP explanations for anything the triage policy sends to human review.
-- A four-bucket triage policy (`agent.py`): escalated (CISA KEV hit), confirmed, review queue, rejected, cross-checked against OSV.dev where the ecosystem supports it.
-- JSON and HTML report output.
+```
+  dependency file                 ┌─────────────────────────────────────────┐
+  (uv.lock / package-lock.json    │  1. PARSE      repo_scan, sbom, schema  │
+   / requirements.txt / SBOM)  ───▶│     what do you actually depend on?     │
+                                  └────────────────┬────────────────────────┘
+                                                   ▼
+                                  ┌─────────────────────────────────────────┐
+   NVD catalog ────── sync ──────▶│  2. LOOK UP    nvd_cache, matching      │
+   CISA KEV    ────── sync ──────▶│     which CVEs name this package, and   │
+                                  │     does the pinned version fall in     │
+                                  │     the affected range?                 │
+                                  └────────────────┬────────────────────────┘
+                                                   ▼
+                                  ┌─────────────────────────────────────────┐
+   package registry ─────────────▶│  3. IDENTIFY   normalize, cpe_dictionary│
+   (PyPI / npm homepage URLs)     │     which CPE vendor is really this     │
+                                  │     package? (the collision problem)    │
+                                  └────────────────┬────────────────────────┘
+                                                   ▼
+                                  ┌─────────────────────────────────────────┐
+                                  │  4. SCORE      labeling, model, explain │
+                                  │     how likely is this a real match?    │
+                                  │     + SHAP: which signals drove it      │
+                                  └────────────────┬────────────────────────┘
+                                                   ▼
+   OSV.dev ──── cross-check ─────▶┌─────────────────────────────────────────┐
+                                  │  5. TRIAGE     agent                    │
+                                  │     four buckets, explained below       │
+                                  └────────────────┬────────────────────────┘
+                                                   ▼
+                                  ┌─────────────────────────────────────────┐
+                                  │  6. REPORT     report, mcp_server       │
+                                  │     markdown / JSON / HTML              │
+                                  └─────────────────────────────────────────┘
+```
 
-### The follow-up work: analyzing the models, going deeper on explainability, and auditing our own claim
+### The modules
 
-After the original Week 3 run, three more questions got asked, and answering them honestly turned up real problems worth fixing rather than confirming everything was fine.
+| Module | Job |
+|---|---|
+| `schema.py` | The one shape everything speaks: name, version, ecosystem, purl. |
+| `repo_scan.py` | Reads `uv.lock`, `package-lock.json`, `requirements.txt`. |
+| `sbom.py` | Reads and writes CycloneDX/SPDX. Builds an SBOM from a component list. |
+| `generate_sbom.py` | Makes a real SBOM from a repo that has none, using no external tool. |
+| `image_scan.py` | Catalogues a container image by shelling out to Syft. |
+| `nvd_client.py` | Talks to NVD's API — paging, retries, rate limiting. |
+| `nvd_cache.py` | Local SQLite copy of the CVE catalog, plus the product index. |
+| `kev.py` | CISA's actively-exploited list. |
+| `osv.py` | OSV.dev, used as an independent second opinion. |
+| `registry.py` | Fetches a package's homepage URLs from PyPI/npm. |
+| `cpe_dictionary.py` | NVD's vendor/product dictionary. |
+| `normalize.py` | Turns a package name into candidate CPE vendors, with signals. |
+| `matching.py` | Finds candidate CVEs and applies version-range logic. |
+| `labeling.py` | Builds the training set and defines the seven features. |
+| `model.py` | Trains logistic regression vs random forest, picks the winner. |
+| `explain.py` | SHAP values — which signal pushed a score up or down. |
+| `agent.py` | The triage policy. Decides which bucket each finding lands in. |
+| `cwe.py` | Translates CWE IDs into plain English. |
+| `report.py` | JSON and HTML output. |
+| `mcp_server.py` | HTTP + MCP front end, and the markdown report. |
 
-**Comparing the two models properly.** Week 3 picked the random forest by risk score alone, a single number. The follow-up looked at where each model's mistakes actually land: on the same held-out test split, logistic regression missed 0 real matches but kept 494 collisions as false positives, while the random forest missed 1 real match but kept only 166. That's why it wins, a small increase in missed vulnerabilities buys a false-positive count less than a third the size.
+### Two things worth understanding
 
-**Going deeper on explainability than one global plot.** The first SHAP summary plot showed feature importance globally, but not what a specific ambiguous finding actually looks like to a reviewer. Two hand-built examples with the identical, perfect name-similarity score were run through the same explanation function the agent itself uses, one with supporting keyword and OSV evidence, one without, and they landed on opposite verdicts (confidence 0.91, confirmed, versus confidence 0.01, sent to review). Name similarity alone was never sufficient to tell a real match from a collision, that finding held up under scrutiny and is the actual reason the model has seven features instead of one.
+**The local cache is not just a speed trick.** Matching can only find CVEs that are in the
+cache, so cache coverage is a *correctness* setting. A half-finished sync produces a
+reassuringly empty report rather than an error — the most dangerous way this tool can be
+wrong. Every report therefore states its own coverage, and an empty result on a thin cache is
+explicitly denied the reading "your code is clean."
 
-**Checking whether the collision problem was actually fixed, not just claimed fixed.** Week 2 had found four PyPI packages in this project's own dependencies whose names collide with unrelated products: `babel` (versus Babel.js), `jupyter` (versus a Microsoft VS Code extension), `json5`, and `jsonpointer` (versus their npm namesakes). Rather than trust that the Week 3 design handled these, a dedicated test ran all four live against real NVD data. Two real bugs turned up:
+**Lookups are indexed, not scanned.** Finding "which CVEs mention this product" used to be a
+text search across every stored record, costing time proportional to the whole cache — fine on
+a small cache, 15+ minutes per scan on a complete one. A `cve_products` table maps product name
+to CVE id, so a lookup is a direct seek. Counter-intuitively, the better the coverage, the
+worse the old approach got.
 
-1. `normalize._domain()` reduced every reference URL down to its bare hosting domain, so two different GitHub repositories, the real `babel` package and the unrelated npm `babel`, both collapsed to `github.com` and looked identical. This broke the collision check for `babel`, `json5`, and `jsonpointer` specifically.
-2. `model._best_threshold()` picked the lowest threshold that tied for minimal risk, rather than a value from the middle of that tied range. Because a missed real vulnerability was weighted so much worse than a false alarm, there was usually a wide plateau of thresholds with identical risk scores, and picking the floor of that plateau meant almost any nonzero confidence was enough to auto-confirm a match, skipping the review queue entirely.
+## How it decides: the four buckets
 
-Both are fixed now, with regression tests. Three of the four collisions are correctly caught after the fix. The fourth, `jupyter`, still gets wrongly confirmed, and that one isn't a bug: `registry_overlap` is deliberately never given to the model as a feature (only as the label), so the model has to reconstruct that signal from proxies, and for this specific case those proxies read exactly like a real match. That's written down as an honest limitation, not hidden.
+Every candidate match lands in exactly one:
 
-**Closing the last input-path gap.** `generate_sbom.py` was added so a repo with no SBOM at all, only its own lockfiles, gets a real CycloneDX document generated from them, with no external tool. It round-trips losslessly through the same parser a third-party SBOM would use, confirmed by a test that generates, reparses, and checks nothing was lost or invented in the process.
+| Bucket | Meaning |
+|---|---|
+| **escalated** | On CISA's actively-exploited list. Being used against real targets now. |
+| **confirmed** | The model cleared its threshold *or* OSV.dev independently agrees — **and** the CPE vendor is not one the package's own homepage contradicts. |
+| **review_queue** | Undecided, not dismissed. Either the model was unsure, or it was confident but the vendor looks wrong. Carries SHAP values so a reviewer can check the reasoning. |
+| **rejected** | The name matched but the pinned version is not affected, or no plausible vendor exists. The collision case. |
 
-### The MCP server and the Cline integration
+Two guards keep `confirmed` honest:
 
-Once the pipeline worked end to end, it got exposed as a single MCP tool, `scan_repo`, in `it_security_agent/mcp_server.py`, running over Streamable HTTP rather than stdio so it can be hosted on a separate machine, such as one running a self-hosted model, instead of the user's own laptop. Because the server is remote, it was deliberately built with no access to the caller's filesystem: `scan_repo` takes a lockfile or SBOM's raw text as an argument, not a path, so whatever agent calls it has to read the file locally first and pass the contents through.
+1. **Cost-weighted threshold.** A missed vulnerability is treated as ten times worse than a
+   false alarm, and that weighting picks both the model and its cutoff. Not accuracy, which
+   would treat both mistakes as equal.
+2. **The vendor gate.** If the package's registry homepage identifies its real vendor, and the
+   CVE matched a *different* vendor, the finding drops to review regardless of confidence. It
+   only fires on positive evidence — absence of registry data never demotes anything. On a real
+   scan this moved four false confirmations (`babel`→Babel.js, `click`→Ubuntu Click, `jupyter`
+   ×2→VS Code) out of `confirmed` while leaving the one genuine finding alone.
 
-A `.clinerules` file at the repo root tells Cline's model exactly how to do that: read the dependency file itself, call `scan_repo` with its content, then relay the result bucket by bucket without inventing a CVE ID, severity, or score that wasn't literally in the tool's output. It also tells the model not to treat the first call's one-to-two-minute delay (the server syncing NVD's catalog before it can answer) as an error.
+Nothing is ever silently dropped. The strictest thing that happens to an uncertain finding is
+that a human is asked to look at it.
 
-The setup this was built against runs a self-hosted Mistral-7B-Instruct through vLLM, registered in Cline as an OpenAI-compatible endpoint, with this repo's MCP server registered separately as a remote tool. Full setup steps are in the README.
+## What this design buys you
 
-### This session: re-running the pipeline for real, and catching a third bug
+Each of these is a property most dependency scanners do not have, and each traces to a
+specific piece of the architecture rather than to effort or tuning.
 
-Everything above had been checked in isolation at some point, but the Week 3 notebook itself had drifted out of sync with a fresh, live run. Re-executing it end to end surfaced a third real bug, this time in the presentation material rather than the scanning logic: the cell that renders Section 4's global SHAP summary plot was feeding the model's raw, multi-class SHAP output directly into `shap.summary_plot()`, instead of slicing to the "real match" class first the way `explain.explain_match()` already did everywhere else. The visible symptom was a garbled, clipped chart. The actual consequence was worse: the wrong data shape produced a wrong ranking, and an earlier write-up had already recorded that wrong ranking as a genuine, "surprising" finding (that `keyword_alignment` and `osv_corroborated` mattered more than name similarity).
+| Strength | How the architecture delivers it | Where |
+|---|---|---|
+| **A clean result can be trusted** | Every report states how much of NVD it searched. On a thin cache, "nothing found" is explicitly denied the reading "you are clean" — most scanners report `0 findings` identically whether they searched everything or 11%. | `_cache_coverage`, `_coverage_caveat` in `mcp_server.py` |
+| **Name collisions get caught** | A package's registry homepage identifies its real vendor; a CVE matching a *different* vendor is demoted. Fires only on positive evidence, so absence of data never demotes a real finding. Took `confirmed` precision from 1-in-5 to 1-in-1 on this repo. | `normalize._domain`, `matching.find_candidates`, `agent.triage_component` |
+| **Nothing is silently dropped** | A miss is weighted 10× a false alarm, and that weighting picks both the model and its cutoff. The worst thing that happens to an uncertain finding is that a human is asked to look. | `model._best_threshold`, `agent.py` |
+| **Uncertainty is explained** | SHAP values attached to exactly the findings a person has to judge, showing which signal moved the score and how far. | `explain.py`, `agent.py` |
+| **Fast enough to run on every change** | Indexed product lookups instead of a full-table text search, batched scoring instead of per-row, and the exploit catalogue held in memory. 158 dependencies against ~368,000 CVEs in **~3.5 s, fully offline**. | `nvd_cache.cve_products`, `model.predict_confidence_batch`, `kev.load_kev_ids` |
+| **Works with a small local model** | Dependency files never enter the model's context — they travel disk → `curl` → server. A 618KB lockfile would be ~4× a 32K window on its own. | `POST /scan`, `get_scan_command` |
+| **The input cannot be doctored** | Only a lockfile is accepted; the SBOM is always rebuilt server-side. A supplied SBOM is a claim, and a claim can omit a vulnerable package. | `sbom.to_cyclonedx`, `_unsupported_input_reason` |
+| **Two independent sources** | OSV.dev is queried separately and can confirm a match the model was unsure about, or flag one it was confident about. | `osv.py`, `report.osv_agreement_summary` |
+| **Drops into any repo** | The rules file is served by the tool that installs it, so a new project bootstraps itself and the two copies never drift. | `get_setup_rules`, `.clinerules/scan-repo.md` |
+| **Reproducible** | 223 tests, ~94% coverage, every external call mocked — the suite never touches a live API or spends rate limit. | `tests/` |
 
-Once the plotting bug was fixed and the notebook re-run against fresh live data, the real ranking turned out to be close to the opposite: `name_similarity` and `vendor_equals_package` are the two features with the widest spread of impact on the model's output, `keyword_alignment` is third, and `osv_corroborated` barely moves the needle in aggregate. The notebook's Summary cell and the presentation script were both corrected to reflect this, with a note explaining that the old claim was retracted, not just quietly replaced. This is the same discipline Section 9 already established for the collision claim: a chart or a sentence that hasn't been checked against a live run is a hypothesis, not a finding.
+### The workflow, end to end
 
-## Decisions made, and why
+```
+  ask Cline "check this repo"
+        │
+        ├─ get_scan_command ──────────▶ returns one curl command, current URL filled in
+        │                               (URL read off the caller's own request headers,
+        │                                so a rotating tunnel address never goes stale)
+        │
+        ├─ curl --data-binary @uv.lock ─▶ POST /scan
+        │        file goes disk → HTTP, never through the model
+        │
+        │   server: parse → SBOM → cache check → match → train → SHAP → triage
+        │           streaming each stage back as it happens
+        │
+        └─ report printed + saved         verdict, coverage, findings, pipeline log
+```
 
-**Read the repo's own lockfile as a first-class input, not just SBOMs.** An SBOM handed to the scanner could be stale, or edited to hide a vulnerable dependency before it ever reaches the tool. Reading the lockfile a repo already resolves its own dependencies against keeps that document outside the trust boundary the scanner has to reason about.
+The streaming is not decoration: a proxy kills any request that produces no bytes for ~100
+seconds, and it is also the only view a user gets of work happening on a remote machine.
 
-**Use fuzzy string matching for CPE vendor resolution, not exact string matching.** NVD's CPE Dictionary is vendor and product strings typed in by a person, with no purl mapping. Exact matching would miss almost everything; fuzzy matching against name similarity, combined with a registry-domain-overlap check, is what makes the vendor-resolution step workable at all, and it's also exactly where the babel-style collision risk comes from.
+## Design decisions, and why
 
-**Use registry-URL overlap only as a training label, never as a model feature.** If the model could see the exact signal used to generate its own answer key, it would just learn to reproduce that signal, not learn anything generalizable. This is regression-tested directly (`test_labeling.py`) so it can't quietly regress.
+**Read the project's own lockfile, not an SBOM someone hands us.** An SBOM supplied by a caller
+is a claim, and a claim can be stale or edited to hide a vulnerable package. A lockfile is what
+the project actually resolved against. The scanner builds its own SBOM from it every time.
 
-**Weight a missed vulnerability ten times worse than a false alarm, and use that weighting for both model selection and the confidence threshold.** A flat accuracy score, or a flat 0.5 cutoff, treats both kinds of mistakes as equally costly, and they aren't: a missed real vulnerability is a security incident waiting to happen, a false alarm is a few minutes of a reviewer's time.
+**Registry-URL overlap is the training label, never a feature.** If the model could see the
+exact signal used to generate its own answer key, it would learn to copy that signal rather than
+generalise. Regression-tested so it cannot quietly creep back in.
 
-**Sync NVD into a local cache once, instead of querying live per package per scan.** Week 2's live-per-package approach took minutes per run and didn't scale to repeated scans. A local SQLite cache, synced on an interval rather than per call, turned every lookup during an actual scan into a local read.
+**Explain only what needs explaining.** A confirmed finding does not need justification — someone
+should be fixing it. An uncertain one does, because a bare confidence number gives a reviewer
+nothing to argue with.
 
-**Attach a SHAP explanation only to review-queue findings, not to every finding.** A confirmed or escalated finding doesn't need justification to act on, someone should already be fixing it. An uncertain finding does, because a bare confidence number gives a reviewer nothing to check their own judgment against.
+**Keep dependency files out of the model's context entirely.** This is the load-bearing rule of
+the whole integration, and it is architectural rather than advisory. A real lockfile is hundreds
+of kilobytes — this repo's own is 618KB, roughly four times a 32K-context model's entire window.
+It does not matter *how* it arrives: a file read, a `cat`, or a tool argument all land in context
+the same way. So the file travels disk → `curl` → server, and the model only ever holds the
+command and the finished report.
 
-**Run the MCP server over Streamable HTTP, with no filesystem access, rather than a local stdio server.** This was a deliberate choice to let the model side and the tool side live on different machines, one running a self-hosted LLM, one running this project's scanner, without either one needing direct access to the other's disk. The caller (Cline) reads files locally and passes content through; the server never touches a path it didn't receive as text.
+That rule shaped the tool surface too. Tools that take file *content* as a parameter are hidden
+by default, because a model asked to scan for vulnerabilities picks the most on-the-nose tool it
+can see — and a required parameter named `lockfile_content` tells it to go read the file. No
+amount of instruction text outranks a schema. Removing the parameter from view does.
 
-**Treat every claim as something to verify against a live run, not something to write down once and trust.** This shows up three separate times in the project's own history: the collision-fix claim, the model feature-importance claim, and this session's chart-rendering claim. All three were checked against real execution, and two of the three turned out to be wrong on first write-up. That pattern is now the project's actual testing philosophy, not just an aspiration.
+**Verify every claim against a live run.** This appears three times in the project's history:
+the collision fix, the feature-importance ranking, and a chart-rendering bug. Two of the three
+were wrong when first written up. A chart or a sentence that has not been checked against real
+execution is a hypothesis, not a finding.
+
+## What went wrong, and what it taught
+
+Four bugs found by checking rather than trusting:
+
+1. **Domain matching was too coarse.** Every reference URL collapsed to its bare host, so two
+   unrelated GitHub projects both became `github.com` and looked identical. Broke collision
+   detection for `babel`, `json5`, and `jsonpointer`. Fixed by keeping owner and repo segments
+   for multi-tenant hosts.
+2. **The decision threshold sat at the floor.** Because misses are weighted so heavily, many
+   thresholds tie for best risk score; the code picked the lowest, so almost any nonzero
+   confidence auto-confirmed and the review queue was effectively bypassed. Fixed by taking the
+   middle of the tied range.
+3. **A SHAP chart was fed the wrong data shape**, producing a wrong feature ranking that had
+   already been written up as a real finding. Once fixed, the ranking came out close to the
+   opposite. The old claim was retracted in writing rather than quietly replaced.
+4. **Vendor collisions still reached `confirmed`** even after 1 and 2. This one was not an
+   implementation bug but the ceiling of a seven-proxy-feature model, and it is what the vendor
+   gate was added to address.
 
 ## Current state
 
-The test suite runs 124 tests, all passing, with every external call (NVD, the CPE Dictionary, OSV, CISA, the PyPI and npm registries) mocked, so running the tests never touches a live API or spends rate limit. The last full coverage run measured around 94% across the package. What's still unverified in a live environment specifically: `image_scan.py`'s Syft integration is only exercised against a mocked subprocess call, since Syft and Docker haven't been available wherever this has run so far.
+- **223 tests passing, ~94% coverage.** Every external call is mocked, so the suite never touches
+  a live API or spends rate limit.
+- A full scan of this repo's 158 dependencies against a complete ~368,000-CVE cache runs in about
+  **3.5 seconds, entirely offline**.
+- Reports state their own cache coverage, so a clean result can be read in context.
 
-## The interface decision: why there is no standalone upload interface
+## What is still open
 
-This project does not have, and does not need, a page where someone uploads an SBOM file, points at a Docker image, or picks a lockfile from their machine. That kind of interface assumes a user interacting with a standalone tool as a distinct step, separate from asking for what they actually want. This project's actual interface is Cline, a conversational, prompt-driven coding agent, and that changes what "giving it a file" even means.
-
-In this setup, a user doesn't hand the scanner a file at all. They ask, in plain language, something like "check this repo for vulnerabilities," and `.clinerules` tells Cline's model to read whatever dependency file is relevant on its own and pass the contents to the `scan_repo` tool as part of answering that request. The file-reading step still happens, but it happens inside the conversation, driven by intent, not as a separate upload action a user performs against a standalone interface.
-
-Building a dedicated upload UI on top of that would be redundant, and arguably worse: it would ask a user to manually do a step the conversational interface already does for them, and it would need its own way to select a lockfile, a container image, or an SBOM format, decisions `.clinerules` already makes automatically based on what it finds in the repo. The prompt is the interface. That's a deliberate consequence of choosing Cline as the front end, not a missing feature.
-
-## What's still open
-
-- Proper packaging is in place (`[build-system]` in `pyproject.toml` makes the package genuinely pip-installable now), but the presentation notebook still adds the repo root to `sys.path` rather than relying on an editable install, since re-running the entire live pipeline just to drop that workaround hasn't been worth it yet.
-- The training set still relies on registry-URL overlap as its only ground-truth signal. It's a real signal, but the `jupyter` limitation shows its ceiling: a feature that captures registry or CPE-reference similarity more directly, with the same leakage guard `registry_overlap` already has, is the honest next step.
-- `image_scan.py`'s Syft integration has never run against a live Syft or Docker setup, only against its own mocked tests.
-- A bigger, more varied training set beyond this project's own dependency list would make the model comparison in Section 7 more meaningful than a single project's worth of collisions.
+- **Container images are library-only.** `image_scan.py` shells out to Syft and is tested against
+  a mocked subprocess, but the path is not exposed through the server, and it has never been run
+  against a live Syft or Docker setup.
+- **OS packages get no vendor resolution.** Registry lookups cover PyPI and npm only, so
+  Debian/Alpine components carry no homepage signal — they cannot be labelled, cannot train the
+  model, and cannot trigger the vendor gate. A mostly-OS image would fall back to untriaged raw
+  matches.
+- **The training signal has a ceiling.** Registry-URL overlap is real but coarse. Something that
+  captures CPE-reference similarity more directly, with the same leakage guard, is the honest next
+  step.
+- **The training set is one project's dependencies.** A broader, more varied set would make the
+  model comparison mean more than a single project's worth of collisions.

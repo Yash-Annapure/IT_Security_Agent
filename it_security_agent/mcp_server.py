@@ -203,6 +203,37 @@ def _detect_lockfile_type(content: str) -> str:
     return "requirements.txt"  # plain text, no structural marker - the fallback guess
 
 
+def _unsupported_input_reason(content: str) -> str | None:
+    """Name the likely mistake when valid-looking JSON parses to zero components.
+
+    Both cases below are things a caller reasonably tries. _detect_lockfile_type() calls
+    any JSON "package-lock.json", so they reach the npm parser, find no `packages` key
+    and yield nothing - and "no components could be parsed" is true but says nothing
+    about what to send instead.
+    """
+    stripped = content.lstrip()
+    if not stripped.startswith("{"):
+        return None
+    try:
+        data = json.loads(stripped)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("bomFormat") == "CycloneDX" or "spdxVersion" in data:
+        return ("this is an SBOM. This tool never accepts one as input, by design - a "
+                "caller-supplied SBOM is an unverifiable claim about what's actually "
+                "pinned. Send the lockfile it was generated from (uv.lock, "
+                "package-lock.json, requirements.txt) and the scan builds its own.")
+    if ("packages" not in data and "lockfileVersion" not in data
+            and ("dependencies" in data or "devDependencies" in data)):
+        return ("this looks like package.json, not package-lock.json. package.json "
+                "records version *ranges* (\"^1.2.3\"), and a range cannot be matched "
+                "against NVD's affected-version ranges - only an exact pinned version "
+                "can. Send package-lock.json instead.")
+    return None
+
+
 _BARE_LOCKFILE_PATH = re.compile(r"^[\w./\\:\-]+\.(lock|json|txt)$", re.IGNORECASE)
 
 
@@ -872,7 +903,9 @@ def _run_scan(lockfile_content: str, lockfile_type: str = "", max_components: in
 
     components = parse_lockfile_components(lockfile_content, lockfile_type)
     if not components:
-        return "No components could be parsed from the provided lockfile."
+        reason = _unsupported_input_reason(lockfile_content)
+        return (f"No components could be parsed - {reason}" if reason
+                else "No components could be parsed from the provided lockfile.")
     kind = lockfile_type or _detect_lockfile_type(lockfile_content)
     ecosystems = sorted({c.ecosystem for c in components})
     step(f"Parsed {len(components)} components from {kind} ({', '.join(ecosystems)})")
@@ -971,7 +1004,11 @@ async def scan_http_endpoint(request):
     try:
         components = parse_lockfile_components(text)
         if not components:
-            return PlainTextResponse("No components could be parsed from the provided lockfile.", status_code=400)
+            reason = _unsupported_input_reason(text)
+            return PlainTextResponse(
+                f"No components could be parsed - {reason}" if reason
+                else "No components could be parsed from the provided lockfile.",
+                status_code=400)
     except Exception as exc:
         return PlainTextResponse(f"Could not parse lockfile: {exc}", status_code=400)
 
