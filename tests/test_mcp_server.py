@@ -136,26 +136,56 @@ def _fake_ctx(headers):
     return SimpleNamespace(request_context=SimpleNamespace(request=request))
 
 
-def test_get_condense_command_derives_https_url_from_forwarded_headers():
+def test_get_scan_command_derives_https_url_from_forwarded_headers():
     # The tunnel (cloudflared) terminates TLS and forwards plain HTTP, so the original
     # scheme arrives in x-forwarded-proto and the public hostname in host.
     ctx = _fake_ctx({"host": "example.trycloudflare.com", "x-forwarded-proto": "https"})
-    text = mcp_server.get_condense_command(ctx)
-    assert "https://example.trycloudflare.com/condense" in text
+    text = mcp_server.get_scan_command(ctx)
+    assert "https://example.trycloudflare.com/scan" in text
     assert "--data-binary" in text
     assert "curl.exe" in text  # PowerShell variant included
+    assert "1-2 minutes" in text  # warns about first-call NVD sync so the model waits
 
 
-def test_get_condense_command_falls_back_to_http_without_proto_header():
+def test_get_scan_command_falls_back_to_http_without_proto_header():
     ctx = _fake_ctx({"host": "192.168.1.42:8765"})
-    text = mcp_server.get_condense_command(ctx)
-    assert "http://192.168.1.42:8765/condense" in text
+    text = mcp_server.get_scan_command(ctx)
+    assert "http://192.168.1.42:8765/scan" in text
 
 
-def test_get_condense_command_asks_the_user_when_no_request_is_available():
-    text = mcp_server.get_condense_command(_fake_ctx(None))
+def test_get_scan_command_asks_the_user_when_no_request_is_available():
+    text = mcp_server.get_scan_command(_fake_ctx(None))
     assert "Ask the user" in text
-    assert "/condense" in text  # still explains the command shape
+    assert "/scan" in text  # still explains the command shape
+
+
+def test_scan_http_endpoint_returns_the_finished_report():
+    with patch.object(mcp_server, "get_connection", return_value="conn"), \
+         patch.object(mcp_server, "_ensure_synced"), \
+         patch.object(mcp_server, "prewarm"), \
+         patch.object(mcp_server, "run_pipeline", return_value=None), \
+         patch.object(mcp_server, "raw_matches", return_value=[]):
+        resp = _http_client().post("/scan", content=UV_LOCK_TEXT.encode("utf-8"))
+    assert resp.status_code == 200
+    assert "Vulnerability scan result" in resp.text
+    assert "Generated SBOM" not in resp.text  # SBOM off by default
+
+
+def test_scan_http_endpoint_includes_sbom_only_when_requested():
+    with patch.object(mcp_server, "get_connection", return_value="conn"), \
+         patch.object(mcp_server, "_ensure_synced"), \
+         patch.object(mcp_server, "prewarm"), \
+         patch.object(mcp_server, "run_pipeline", return_value=None), \
+         patch.object(mcp_server, "raw_matches", return_value=[]):
+        resp = _http_client().post("/scan?include_sbom=true", content=UV_LOCK_TEXT.encode("utf-8"))
+    assert resp.status_code == 200
+    assert "Generated SBOM" in resp.text
+
+
+def test_scan_http_endpoint_rejects_empty_body_with_usage_hint():
+    resp = _http_client().post("/scan", content=b"")
+    assert resp.status_code == 400
+    assert "--data-binary" in resp.text
 
 
 def _http_client():
@@ -380,7 +410,7 @@ def test_startup_banner_includes_auto_approve_for_scan_repo():
         {"mcpServers": {"it-security-agent": {
             "type": "streamableHttp", "url": "http://10.0.0.5:8765/mcp",
             "timeout": 300,
-            "autoApprove": ["get_condense_command", "condense_lockfile", "scan_repo"],
+            "autoApprove": ["get_scan_command", "condense_lockfile", "scan_repo"],
         }}},
         indent=2,
     )

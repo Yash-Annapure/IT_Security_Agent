@@ -74,7 +74,7 @@ Paste into Cline -> "Configure MCP Servers" (merge into an existing
       "type": "streamableHttp",
       "url": "http://192.168.1.42:8765/mcp",
       "timeout": 300,
-      "autoApprove": ["get_condense_command", "condense_lockfile", "scan_repo"]
+      "autoApprove": ["get_scan_command", "condense_lockfile", "scan_repo"]
     }
   }
 }
@@ -140,66 +140,64 @@ timeout is much shorter and will otherwise report a false failure.
 ### Use it
 
 In Cline, open this repo and ask something like "check this repo's
-dependencies for vulnerabilities." `.clinerules/` tells the model to read the
-lockfile itself, call the `condense_lockfile` MCP tool on it, then call
-`scan_repo` with the condensed result - no further prompting needed, and no
-terminal command anywhere in that chain. The tool has no parameter for a
-pre-made SBOM at all, by design (see the tamper-proofing note above) -
-`.clinerules/` also tells the model not to go looking for one.
+dependencies for vulnerabilities." The whole workflow is three trivial
+actions, and `.clinerules/` walks the model through them:
 
-If you ask for "an SBOM" and the repo only has a lockfile, `scan_repo`
-generates one from it (a real CycloneDX document, not a description of one)
-and returns it inline alongside the findings - `.clinerules/` tells the model
-this counts as the answer, not a "can't do that" response.
+1. Call the `get_scan_command` MCP tool (no arguments) - it returns one
+   terminal command with the server's current URL filled in.
+2. Run that command - it POSTs the lockfile straight from disk to the
+   server's `/scan` endpoint and prints back the finished triaged report.
+3. Save the printed report to `reports/<date>-scan.md`.
+
+If you ask for "an SBOM," the model appends `?include_sbom=true` to the
+scan URL and a real CycloneDX document (not a description of one) comes
+back inline with the findings. There is no way to pass in a pre-made SBOM,
+by design (see the tamper-proofing note above) - `.clinerules/` also tells
+the model not to go looking for one.
 
 ### Keeping lockfiles out of the model's context entirely
 
-The load-bearing rule of this whole workflow: **the raw lockfile's bytes
-must never pass through the model's context window.** A real `uv.lock` is
-often hundreds of KB (this repo's own is 618KB / ~131K tokens - 4x a
-32K-context model's entire window), and it doesn't matter *how* it gets into
-the conversation - a file-read tool, `type`/`cat` output, or an MCP tool
-argument all end up in context just the same. Two earlier designs learned
-this the hard way: a terminal-script flow where the model `type`d the raw
-file (crashed the GPU with an out-of-memory error), and an MCP-tool-only
-flow where the model dutifully *read* the file to pass it as a tool argument
-(instantly overflowed its context - the read itself was the failure).
+The load-bearing rule of this design: **lockfile content never passes
+through the model's context window - not raw, not condensed.** A real
+`uv.lock` is often hundreds of KB (this repo's own is 618KB / ~131K
+tokens - 4x a 32K-context model's entire window), and it doesn't matter
+*how* it gets into the conversation - a file-read tool, `type`/`cat`
+output, or an MCP tool argument all end up in context just the same. Two
+earlier designs learned this the hard way: a terminal-script flow where the
+model `type`d the raw file (crashed the GPU with an out-of-memory error),
+and an MCP-tool-only flow where the model dutifully *read* the file to pass
+it as a tool argument (instantly overflowed its context - the read itself
+was the failure).
 
-The fix is architectural: the MCP server exposes a plain HTTP ingress,
-`POST /condense`, and the model's only job is one terminal command:
+The fix is architectural. The server exposes `POST /scan`: raw lockfile
+bytes in, finished report out, in one shot -
 
 ```
-curl -s -X POST http://<server>:8765/condense --data-binary @uv.lock
+curl -s -X POST http://<server>:8765/scan --data-binary @uv.lock
 ```
 
-`curl` streams the file from disk straight to the server - the model's
-context only ever contains the command itself and the few-KB condensed
-result (just `name==version` pairs, extracted with the exact same parser
-`scan_repo` uses, so the scan result is identical - wheel/sdist URLs and
-hashes were never part of what gets matched against NVD/KEV/OSV anyway).
+`curl` streams the file from disk straight to the server, which condenses
+and scans it server-side; the model's context only ever holds the command
+itself and the small final report it relays. The model never needs to be
+told the server's URL either - a quick cloudflared tunnel mints a new
+random hostname on every boot, so hardcoding it anywhere would rot
+immediately. Instead, the `get_scan_command` MCP tool returns the command
+with the current public URL already filled in, derived from the caller's
+own connection: every MCP request arrives *through* the tunnel, carrying
+the live hostname in its `Host` header (and the original scheme in
+`X-Forwarded-Proto`), so the server reads its own address off the request
+being handled. `.clinerules/` tells the model to always ask that tool
+rather than guessing, remembering, or fabricating a URL.
 
-The model never needs to be told the server's URL, either - a quick
-cloudflared tunnel mints a new random hostname on every boot, so hardcoding
-it anywhere would rot immediately. Instead, the `get_condense_command` MCP
-tool returns the curl command with the current public URL already filled in,
-derived from the caller's own connection: every MCP request arrives
-*through* the tunnel, carrying the live hostname in its `Host` header (and
-the original scheme in `X-Forwarded-Proto`), so the server reads its own
-address off the request being handled. `.clinerules/` tells the model to
-always ask that tool for the command rather than guessing or reusing a URL
-from an earlier session.
-On this repo's own `uv.lock` that's a ~99.5% cut: 618KB -> 3KB, 158
-packages. The model then passes that printed result to the `scan_repo` MCP
-tool. `.clinerules/` forbids reading the raw lockfile outright - locating it
-is fine, opening it is not.
-
-Two backstops remain for when something slips through anyway: a
-`condense_lockfile` MCP tool still exists for small content already
-legitimately in-context, and `serve_mistral.py` rejects any prompt over
-`MAX_INPUT_TOKENS` (default 28000, override via env var) with a clear HTTP
-413 before calling `model.generate()`, so an oversized prompt fails cleanly
-instead of crashing the server. `condense_lockfile.py` (repo root) is a thin
-CLI wrapper over the same logic for use outside Cline.
+Secondary paths, for completeness: `POST /condense` returns just the
+condensed `name==version` list (~99.5% smaller than the raw file - 618KB ->
+3KB on this repo's own lockfile) without scanning; the `scan_repo` and
+`condense_lockfile` MCP tools accept lockfile *content* for the rare case
+it's already legitimately in-context; `condense_lockfile.py` (repo root) is
+a thin CLI wrapper for use outside Cline; and `serve_mistral.py` rejects
+any prompt over `MAX_INPUT_TOKENS` (default 28000) with a clear HTTP 413
+before `model.generate()`, so an oversized prompt fails cleanly instead of
+crashing the server.
 
 ### Using it against a different repo for the first time
 

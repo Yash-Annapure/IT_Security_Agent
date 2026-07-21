@@ -69,13 +69,12 @@ mcp = FastMCP(
         "NEVER read or open a raw lockfile (uv.lock, package-lock.json, "
         "requirements.txt) with your file tool or print it with type/cat - raw "
         "lockfiles are often large enough to overflow your entire context window in "
-        "one message. Instead, condense it in your terminal so only the small result "
-        "enters the conversation: call the get_condense_command tool to get the exact "
-        "curl command with this server's current URL filled in (never guess the URL - "
-        "it can change on every server reboot), run that command, then call the "
-        "scan_repo MCP tool with lockfile_content set to exactly what it printed. "
-        "scan_repo and get_setup_rules are MCP tools only, never terminal commands; "
-        "the condense curl is the one terminal step in the workflow."
+        "one message. The whole scan is three trivial actions: (1) call the "
+        "get_scan_command tool, (2) run the single command it returns, exactly as "
+        "printed, (3) save that command's printed output as the report. Never guess "
+        "or reuse a server URL (it changes on reboot - get_scan_command always has "
+        "the current one), never invent a web address for any MCP tool, and never "
+        "wrap the command in $(...) or nest it inside another command."
     ),
 )
 
@@ -317,16 +316,22 @@ def _derive_public_base(headers) -> str | None:
 
 
 @mcp.tool()
-def get_condense_command(ctx: Context) -> str:
-    """Return the exact terminal command for condensing a lockfile, with this server's
-    CURRENT public URL already filled in.
+def get_scan_command(ctx: Context) -> str:
+    """START HERE for any vulnerability scan. Returns the single terminal command that
+    performs the entire scan, with this server's CURRENT public URL already filled in.
 
-    Call this whenever you need to condense a lockfile and don't know (or aren't sure
-    of) the server's base URL. The URL is derived live from your own connection to this
-    server - the very request you just made carries the hostname you reached it
-    through - so the answer is always current, even though a tunnel URL can change on
-    every server reboot. Never guess the URL and never reuse one remembered from an
-    earlier conversation; call this instead.
+    The whole workflow is: (1) call this tool, (2) run the one command it returns,
+    exactly as printed, (3) save the command's printed output as the report. That's
+    everything - the command sends the lockfile straight from disk to this server and
+    prints back the finished triaged report. Do not read the lockfile, do not modify
+    the command, do not wrap it in $(...) or nest it inside anything.
+
+    The URL in the command is derived live from your own connection to this server -
+    the very request you just made carries the hostname you reached it through - so it
+    is always current, even though a tunnel URL can change on every server reboot.
+    Never guess the URL, never reuse one remembered from an earlier conversation, and
+    never invent a web address for any MCP tool - tools have no URLs; this tool hands
+    you the only URL the workflow needs.
     """
     try:
         request = ctx.request_context.request
@@ -339,15 +344,18 @@ def get_condense_command(ctx: Context) -> str:
             "Could not determine this server's public URL from the current connection "
             "(no Host header available). Ask the user for the it-security-agent server's "
             "base URL - it's the MCP URL in their Cline settings with the trailing /mcp "
-            "removed - then run: curl -s -X POST <base-url>/condense --data-binary @uv.lock"
+            "removed - then run: curl -s -X POST <base-url>/scan --data-binary @uv.lock"
         )
     return (
-        "Run exactly one of these in the terminal, substituting the real lockfile "
-        "filename after the @ if it isn't uv.lock:\n\n"
-        f"  bash / cmd:         curl -s -X POST {base}/condense --data-binary @uv.lock\n"
-        f"  Windows PowerShell: curl.exe -s -X POST {base}/condense --data-binary '@uv.lock'\n\n"
-        "It prints the condensed name==version list - pass exactly that printed text to "
-        "scan_repo's lockfile_content. Do not read the raw lockfile yourself."
+        "Run exactly ONE of these in the terminal, as printed - substituting only the "
+        "lockfile filename after the @ if it isn't uv.lock:\n\n"
+        f"  bash / cmd:         curl -s -X POST {base}/scan --data-binary @uv.lock\n"
+        f"  Windows PowerShell: curl.exe -s -X POST {base}/scan --data-binary '@uv.lock'\n\n"
+        "The printed output is the finished vulnerability report - save it to "
+        "reports/<YYYY-MM-DD>-scan.md and relay it to the user. The first run after a "
+        "server restart can take 1-2 minutes (it syncs NVD's CVE catalog) - wait for "
+        "it, don't retry or cancel. If the user explicitly asked for an SBOM, append "
+        "?include_sbom=true to the URL."
     )
 
 
@@ -530,6 +538,13 @@ def scan_repo(
             "real text here instead."
         )
 
+    return _run_scan(lockfile_content, lockfile_type, max_components, include_sbom)
+
+
+def _run_scan(lockfile_content: str, lockfile_type: str = "", max_components: int = 40,
+              include_sbom: bool = False) -> str:
+    """The actual scan pipeline, shared by the scan_repo MCP tool and the /scan HTTP
+    endpoint - parse, generate SBOM, sync caches, match, triage, format."""
     components = parse_lockfile_components(lockfile_content, lockfile_type)
     if not components:
         return "No components could be parsed from the provided lockfile."
@@ -551,6 +566,41 @@ def scan_repo(
     if include_sbom:
         text += format_sbom_section(generated_bom)
     return text
+
+
+@mcp.custom_route("/scan", methods=["POST"])
+async def scan_http_endpoint(request):
+    """One-shot HTTP scan: POST raw lockfile bytes, get the final triaged report back.
+
+    This is the whole workflow in a single terminal command - the calling agent runs
+    the curl that get_scan_command returns, and the printed output IS the finished
+    report, ready to save. Nothing lockfile-related ever enters the model's context:
+    not the raw file (which can overflow a small model's context on its own), and not
+    even the condensed package list - the model only relays the report. Condensing
+    happens implicitly (the parser here is the same one /condense uses).
+
+    Query params: include_sbom=true to append the generated CycloneDX SBOM (only when
+    the user explicitly asked for an SBOM - it adds tens of KB on a real tree).
+    """
+    from starlette.concurrency import run_in_threadpool
+    from starlette.responses import PlainTextResponse
+
+    body = await request.body()
+    text = body.decode("utf-8", errors="replace")
+    if not text.strip():
+        return PlainTextResponse(
+            "Empty body. POST the raw lockfile bytes, e.g.: "
+            "curl -s -X POST <this-server>/scan --data-binary @uv.lock",
+            status_code=400,
+        )
+    include_sbom = request.query_params.get("include_sbom", "").lower() in ("true", "1", "yes")
+    try:
+        # The pipeline is synchronous and slow on first call (NVD sync, 1-2 min) -
+        # run it off the event loop so the server stays responsive to MCP traffic.
+        report = await run_in_threadpool(_run_scan, text, "", 40, include_sbom)
+    except ValueError as exc:
+        return PlainTextResponse(str(exc), status_code=400)
+    return PlainTextResponse(report)
 
 
 def _detect_reachable_host() -> str | None:
@@ -588,7 +638,7 @@ def startup_banner(host: str, port: int) -> str:
         cline_config = json.dumps(
             {"mcpServers": {"it-security-agent": {
                 "type": "streamableHttp", "url": url, "timeout": 300,
-                "autoApprove": ["get_condense_command", "condense_lockfile", "scan_repo"],
+                "autoApprove": ["get_scan_command", "condense_lockfile", "scan_repo"],
             }}},
             indent=2,
         )
@@ -605,12 +655,13 @@ def startup_banner(host: str, port: int) -> str:
             "caller's machine. Remove any name from the list if you'd rather approve",
             "those calls by hand.",
             "",
-            "Raw-lockfile ingress (keeps big lockfiles out of the model's context):",
-            f"  curl -s -X POST http://{public_host}:{port}/condense --data-binary @uv.lock",
+            "One-shot scan over HTTP (raw lockfile bytes in, finished report out - the",
+            "model's context never touches lockfile content):",
+            f"  curl -s -X POST http://{public_host}:{port}/scan --data-binary @uv.lock",
             "Behind a tunnel (e.g. cloudflared) the hostname above is wrong - but nobody",
-            "needs to track it: the get_condense_command tool returns this command with",
-            "the live public URL filled in, derived from the caller's own connection, so",
-            "it stays correct even when a quick tunnel mints a new URL every boot.",
+            "needs to track it: the get_scan_command tool returns this command with the",
+            "live public URL filled in, derived from the caller's own connection, so it",
+            "stays correct even when a quick tunnel mints a new URL every boot.",
             "",
             "No built-in auth - only expose this on a private/trusted network.",
         ]
