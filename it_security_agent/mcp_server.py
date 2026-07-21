@@ -642,8 +642,16 @@ def _condense(lockfile_content: str, lockfile_type: str = "") -> str:
     if not components:
         raise ValueError("No components could be parsed from the provided lockfile - nothing to condense.")
     if all(c.ecosystem == "npm" for c in components):
-        packages = {f"node_modules/{c.name}": {"version": c.version} for c in components}
-        return json.dumps({"packages": packages})
+        # Stays JSON, unlike the flat PyPI form below, because that form round-trips
+        # through _detect_lockfile_type as requirements.txt - npm packages would come
+        # back as PyPI and be matched against the wrong ecosystem entirely.
+        #
+        # The bulk is trimmed instead: parse_package_lock_text splits on "node_modules/"
+        # and takes the last segment, so a bare name re-parses identically, and compact
+        # separators drop the spaces json.dumps adds by default. ~30% smaller, which on
+        # a real 1500-package lock is thousands of tokens of a small model's context.
+        packages = {c.name: {"version": c.version} for c in components}
+        return json.dumps({"packages": packages}, separators=(",", ":"))
     pypi_lines = [f"{c.name}=={c.version}" for c in components if c.ecosystem == "PyPI"]
     return "\n".join(pypi_lines)
 
