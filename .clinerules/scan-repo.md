@@ -5,6 +5,25 @@ checks this repo's dependencies against NVD, CISA KEV, and OSV.dev, and
 returns a triaged findings report. You may be running as a small (~7B) local
 model - follow these steps literally, in order, every time.
 
+## `scan_repo` is an MCP tool, not a script - never run it from a terminal
+
+There is no `scan_repo.py`, no `scan_repo` executable, and no CLI wrapper
+anywhere in this repo, under any name. `scan_repo` and `get_setup_rules`
+exist *only* as tools on the `it-security-agent` MCP server - call them
+through your MCP tool-use mechanism, the same way you'd call any other MCP
+tool, never via `python scan_repo.py`, `uv run scan_repo.py`,
+`it-security-agent scan_repo`, or any other shell/terminal command.
+
+`condense_lockfile.py` (repo root) is the *only* real, runnable script in
+this workflow - don't assume `scan_repo` works the same way just because
+that one does; they are not the same kind of thing. If a command referencing
+`scan_repo` fails with "No such file or directory" or similar, that is not a
+sign the file is missing from some other location - it means you tried to
+run an MCP tool as a shell command by mistake. Don't ask the user where the
+file is; there is no file, anywhere, to find. Recognize the mistake yourself
+and call `scan_repo` as an MCP tool instead, in the same turn, without
+asking - you already have everything you need to do that correctly.
+
 ## When to use it
 
 Use `scan_repo` whenever the user asks you to check this repo (or its
@@ -30,10 +49,24 @@ re-describing the plan on every reply.
    earlier in this conversation for some other reason) - in this order of
    preference: `uv.lock` (or any other `*.lock`), `package-lock.json`,
    `requirements.txt`.
-2. Run `condense_lockfile.py <that file>` with your terminal tool (e.g.
+2. Run `condense_lockfile.py <that file>` **with your terminal tool** (e.g.
    `uv run condense_lockfile.py uv.lock`, or `python condense_lockfile.py
-   package-lock.json`), then call `scan_repo` with `lockfile_content` set to
-   exactly what that command printed to stdout.
+   package-lock.json`) - this is the one step in this workflow that's a
+   terminal command. Then invoke the `scan_repo` **MCP tool** (not a
+   terminal command - use your MCP tool-call mechanism) with
+   `lockfile_content` set to exactly what that command printed to stdout.
+
+   **If you redirected that command's output to a file** (e.g.
+   `... > reports/condensed_lockfile.txt`) instead of using its printed
+   output directly, you now have to **read that file with your own
+   file-read tool** and use the text it returns as `lockfile_content` -
+   the exact same rule as for the original lockfile in step 1. Do **not**
+   pass the file's path, a `cat`/`type` command, or any `$(...)`/backtick
+   substitution as the value instead of the file's actual contents - none
+   of those get expanded by the MCP tool, they arrive as literal text and
+   the call will fail. If you already have the printed output in hand from
+   running the command, prefer using that directly and skip writing it to
+   a file at all.
 
 **Always condense first - never `type`/`cat` the raw lockfile into the
 conversation, and never pass the raw file's content directly.** Raw lockfiles
