@@ -144,7 +144,7 @@ def test_get_scan_command_derives_https_url_from_forwarded_headers():
     assert "https://example.trycloudflare.com/scan" in text
     assert "--data-binary" in text
     assert "curl.exe" in text  # PowerShell variant included
-    assert "1-2 minutes" in text  # warns about first-call NVD sync so the model waits
+    assert "don't retry or cancel" in text  # warns about first-call duration so the model waits
 
 
 def test_get_scan_command_falls_back_to_http_without_proto_header():
@@ -186,6 +186,27 @@ def test_scan_http_endpoint_rejects_empty_body_with_usage_hint():
     resp = _http_client().post("/scan", content=b"")
     assert resp.status_code == 400
     assert "--data-binary" in resp.text
+
+
+def test_scan_http_endpoint_rejects_unparseable_content_before_streaming():
+    # Garbage must fail with a real 400 up front - once the streamed 200 begins,
+    # the status can't be changed, so validation has to happen before the stream.
+    resp = _http_client().post("/scan", content=b'{"packages": {"": {}}}')
+    assert resp.status_code == 400
+    assert "No components could be parsed" in resp.text
+
+
+def test_scan_http_endpoint_streams_keepalive_header_before_the_report():
+    with patch.object(mcp_server, "get_connection", return_value="conn"), \
+         patch.object(mcp_server, "_ensure_synced"), \
+         patch.object(mcp_server, "prewarm"), \
+         patch.object(mcp_server, "run_pipeline", return_value=None), \
+         patch.object(mcp_server, "raw_matches", return_value=[]):
+        resp = _http_client().post("/scan", content=UV_LOCK_TEXT.encode("utf-8"))
+    assert resp.status_code == 200
+    # The keepalive preamble (what defeats Cloudflare's ~100s proxy timeout) comes
+    # first, then the report.
+    assert resp.text.index("Scanning") < resp.text.index("Vulnerability scan result")
 
 
 def _http_client():
@@ -256,7 +277,8 @@ def test_prewarm_calls_cpe_search_per_unique_name():
         Component(name="django", version="2.0", ecosystem="PyPI", source="t"),  # duplicate name
         Component(name="flask", version="1.0", ecosystem="PyPI", source="t"),
     ]
-    with patch.object(mcp_server.cpe_dictionary, "search") as mock_search, \
+    with patch.object(mcp_server.cpe_dictionary, "is_cached", return_value=False), \
+         patch.object(mcp_server.cpe_dictionary, "search") as mock_search, \
          patch.object(mcp_server.time, "sleep"):
         mcp_server.prewarm(components, conn="conn")
     assert {call.args[0] for call in mock_search.call_args_list} == {"django", "flask"}
@@ -264,7 +286,8 @@ def test_prewarm_calls_cpe_search_per_unique_name():
 
 def test_prewarm_swallows_search_failures():
     components = [Component(name="broken", version="1.0", ecosystem="PyPI", source="t")]
-    with patch.object(mcp_server.cpe_dictionary, "search", side_effect=Exception("boom")), \
+    with patch.object(mcp_server.cpe_dictionary, "is_cached", return_value=False), \
+         patch.object(mcp_server.cpe_dictionary, "search", side_effect=Exception("boom")), \
          patch.object(mcp_server.time, "sleep"):
         mcp_server.prewarm(components, conn="conn")  # must not raise
 
@@ -274,7 +297,8 @@ def test_prewarm_stops_at_time_budget():
         Component(name="a", version="1.0", ecosystem="PyPI", source="t"),
         Component(name="b", version="1.0", ecosystem="PyPI", source="t"),
     ]
-    with patch.object(mcp_server.cpe_dictionary, "search") as mock_search, \
+    with patch.object(mcp_server.cpe_dictionary, "is_cached", return_value=False), \
+         patch.object(mcp_server.cpe_dictionary, "search") as mock_search, \
          patch.object(mcp_server.time, "sleep"):
         mcp_server.prewarm(components, conn="conn", budget_seconds=-1)  # already "expired"
     mock_search.assert_not_called()
@@ -367,9 +391,31 @@ def test_scan_repo_generated_sbom_covers_full_list_not_just_scanned_subset():
 
 def test_main_runs_streamable_http_transport():
     with patch.object(mcp_server.mcp, "run") as mock_run, \
-         patch.object(mcp_server, "startup_banner", return_value="banner"):
+         patch.object(mcp_server, "startup_banner", return_value="banner"), \
+         patch.object(mcp_server, "_start_background_sync") as mock_sync:
         mcp_server.main()
     mock_run.assert_called_once_with(transport="streamable-http")
+    mock_sync.assert_called_once()  # NVD/KEV sync kicks off at startup, not on first scan
+
+
+def test_prewarm_skips_sleep_and_network_for_cached_names():
+    components = [Component(name="django", version="2.2.0", ecosystem="PyPI", source="t")]
+    with patch.object(mcp_server.cpe_dictionary, "is_cached", return_value=True), \
+         patch.object(mcp_server.cpe_dictionary, "search") as mock_search, \
+         patch.object(mcp_server.time, "sleep") as mock_sleep:
+        mcp_server.prewarm(components, conn="conn")
+    mock_search.assert_not_called()
+    mock_sleep.assert_not_called()
+
+
+def test_prewarm_fetches_and_spaces_requests_for_uncached_names():
+    components = [Component(name="django", version="2.2.0", ecosystem="PyPI", source="t")]
+    with patch.object(mcp_server.cpe_dictionary, "is_cached", return_value=False), \
+         patch.object(mcp_server.cpe_dictionary, "search") as mock_search, \
+         patch.object(mcp_server.time, "sleep") as mock_sleep:
+        mcp_server.prewarm(components, conn="conn")
+    mock_search.assert_called_once()
+    mock_sleep.assert_called_once()
 
 
 def test_detect_reachable_host_returns_an_ip_on_success():

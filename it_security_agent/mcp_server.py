@@ -104,6 +104,29 @@ def _ensure_synced(conn):
     _last_synced = time.time()
 
 
+def _start_background_sync():
+    """Kick off the NVD/KEV sync in a daemon thread at server startup.
+
+    The sync takes 1-2 minutes cold - previously it ran lazily inside the FIRST scan
+    request, which pushed that request's total time past Cloudflare's ~100s proxy
+    timeout and returned a 524 to the caller. Doing it at startup means it has usually
+    finished long before anyone scans, and the request path's _ensure_synced() becomes
+    a no-op (the thread updates _last_synced on success). Uses its own SQLite
+    connection - connections aren't shareable across threads.
+    """
+    import threading
+
+    def work():
+        try:
+            _ensure_synced(nvd_cache.get_connection())
+            print("[sync] NVD/KEV background sync complete.", flush=True)
+        except Exception as exc:
+            # A failed startup sync isn't fatal - the request path will retry lazily.
+            print(f"[sync] background sync failed ({exc}) - will retry on first scan.", flush=True)
+
+    threading.Thread(target=work, daemon=True, name="nvd-kev-sync").start()
+
+
 def _detect_lockfile_type(content: str) -> str:
     stripped = content.lstrip()
     if stripped.startswith("{"):
@@ -168,6 +191,12 @@ def prewarm(components, conn, budget_seconds=PREWARM_BUDGET_SECONDS):
     names = sorted({c.name for c in components})
     t0 = time.time()
     for name in names:
+        # Cache hits make no network request, so they need no rate-limit spacing and
+        # cost no budget. This is what makes repeat scans fast: previously every name
+        # paid the sleep unconditionally, ~40-90s of pure sleeping per scan even when
+        # every single name was already cached from the last run.
+        if cpe_dictionary.is_cached(name, conn=conn):
+            continue
         if time.time() - t0 > budget_seconds:
             break  # a name that doesn't get cached just produces no vendor candidates later
         try:
@@ -349,12 +378,15 @@ def get_scan_command(ctx: Context) -> str:
     return (
         "Run exactly ONE of these in the terminal, as printed - substituting only the "
         "lockfile filename after the @ if it isn't uv.lock:\n\n"
-        f"  bash / cmd:         curl -s -X POST {base}/scan --data-binary @uv.lock\n"
-        f"  Windows PowerShell: curl.exe -s -X POST {base}/scan --data-binary '@uv.lock'\n\n"
-        "The printed output is the finished vulnerability report - save it to "
-        "reports/<YYYY-MM-DD>-scan.md and relay it to the user. The first run after a "
-        "server restart can take 1-2 minutes (it syncs NVD's CVE catalog) - wait for "
-        "it, don't retry or cancel. If the user explicitly asked for an SBOM, append "
+        f"  Windows PowerShell (use this one on Windows - plain `curl` will NOT work "
+        f"there):\n    curl.exe -s -X POST {base}/scan --data-binary '@uv.lock'\n\n"
+        f"  bash / zsh (Linux/macOS):\n    curl -s -X POST {base}/scan --data-binary @uv.lock\n\n"
+        "The command streams: it first prints a 'Scanning' line and keepalive dots "
+        "while the server works (usually seconds; up to ~2 minutes on the first run "
+        "after a server restart) - wait for it to finish, don't retry or cancel. "
+        "Everything printed after the dots is the finished vulnerability report - "
+        "save the full output to reports/<YYYY-MM-DD>-scan.md and relay the report "
+        "to the user. If the user explicitly asked for an SBOM, append "
         "?include_sbom=true to the URL."
     )
 
@@ -579,11 +611,19 @@ async def scan_http_endpoint(request):
     even the condensed package list - the model only relays the report. Condensing
     happens implicitly (the parser here is the same one /condense uses).
 
+    The response STREAMS: a short header goes out immediately and keepalive dots
+    follow while the scan runs. This is what makes the command work through proxies
+    like Cloudflare's tunnels, which kill any request with no response bytes within
+    ~100 seconds (a cold first scan used to blow through that and 524) - once the
+    first byte is out, the connection stays alive for as long as the scan needs.
+
     Query params: include_sbom=true to append the generated CycloneDX SBOM (only when
     the user explicitly asked for an SBOM - it adds tens of KB on a real tree).
     """
-    from starlette.concurrency import run_in_threadpool
-    from starlette.responses import PlainTextResponse
+    import threading
+
+    import anyio
+    from starlette.responses import PlainTextResponse, StreamingResponse
 
     body = await request.body()
     text = body.decode("utf-8", errors="replace")
@@ -593,14 +633,38 @@ async def scan_http_endpoint(request):
             "curl -s -X POST <this-server>/scan --data-binary @uv.lock",
             status_code=400,
         )
-    include_sbom = request.query_params.get("include_sbom", "").lower() in ("true", "1", "yes")
+    # Parsing is pure and fast - validate it up front so garbage input still gets a
+    # proper 400 status, which is impossible once the streamed 200 has started.
     try:
-        # The pipeline is synchronous and slow on first call (NVD sync, 1-2 min) -
-        # run it off the event loop so the server stays responsive to MCP traffic.
-        report = await run_in_threadpool(_run_scan, text, "", 40, include_sbom)
-    except ValueError as exc:
-        return PlainTextResponse(str(exc), status_code=400)
-    return PlainTextResponse(report)
+        if not parse_lockfile_components(text):
+            return PlainTextResponse("No components could be parsed from the provided lockfile.", status_code=400)
+    except Exception as exc:
+        return PlainTextResponse(f"Could not parse lockfile: {exc}", status_code=400)
+
+    include_sbom = request.query_params.get("include_sbom", "").lower() in ("true", "1", "yes")
+
+    outcome = {}
+
+    def work():
+        try:
+            outcome["report"] = _run_scan(text, "", 40, include_sbom)
+        except Exception as exc:
+            outcome["error"] = str(exc)
+
+    async def stream():
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+        yield b"Scanning (dots are keepalive progress - the report follows when done)\n"
+        while worker.is_alive():
+            await anyio.sleep(5)
+            yield b"."
+        yield b"\n\n"
+        if "error" in outcome:
+            yield f"ERROR: {outcome['error']}".encode("utf-8")
+        else:
+            yield outcome["report"].encode("utf-8")
+
+    return StreamingResponse(stream(), media_type="text/plain")
 
 
 def _detect_reachable_host() -> str | None:
@@ -674,6 +738,7 @@ def startup_banner(host: str, port: int) -> str:
 
 def main():
     print(startup_banner(MCP_HOST, MCP_PORT), flush=True)
+    _start_background_sync()
     mcp.run(transport="streamable-http")
 
 

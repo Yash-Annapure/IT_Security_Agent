@@ -8,14 +8,18 @@ do them in order, every time, nothing more:
 
 1. **Call the `get_scan_command` MCP tool** (it takes no arguments). It
    returns one terminal command with the server's current URL filled in.
-2. **Run that command in the terminal, exactly as printed.** Pick the line
-   matching your shell (`curl.exe` variant on Windows PowerShell). If the
-   repo's lockfile isn't `uv.lock`, substitute the real filename after the
-   `@` - that is the ONLY change you may make. The first run after a server
-   restart can take 1-2 minutes (NVD catalog sync) - wait, don't retry or
-   cancel.
-3. **Save the command's printed output** to `reports/<YYYY-MM-DD>-scan.md`
-   (create `reports/` if needed) and relay it to the user in chat. Done.
+2. **Run that command in the terminal, exactly as printed.** This machine
+   uses Windows PowerShell, so use the `curl.exe` line (plain `curl` does
+   NOT work in PowerShell - it's an alias for a different command, and an
+   unquoted `@` is a parse error there; the `curl.exe ... '@uv.lock'` line
+   avoids both). If the repo's lockfile isn't `uv.lock`, substitute the
+   real filename after the `@` - that is the ONLY change you may make.
+   The command streams: it prints a "Scanning" line and keepalive dots
+   while the server works (usually seconds; up to ~2 minutes right after a
+   server restart) - wait for it to finish, don't retry or cancel.
+3. **Save the command's full printed output** to
+   `reports/<YYYY-MM-DD>-scan.md` (create `reports/` if needed) and relay
+   the report to the user in chat. Done.
 
 If you are in Cline's Plan mode you cannot use tools - say so and ask the
 user to switch to Act mode instead of re-describing the plan.

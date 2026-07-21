@@ -16,6 +16,20 @@ def _table(conn):
     conn.commit()
 
 
+def is_cached(keyword: str, conn=None) -> bool:
+    """True if search() would be answered from the local cache, with no NVD request.
+
+    Callers that rate-limit around search() (sleeping between calls to respect NVD's
+    request spacing) use this to skip the sleep entirely for cached keywords - a
+    cache hit makes no network request, so there is nothing to space out.
+    """
+    conn = conn or nvd_cache.get_connection()
+    _table(conn)
+    return conn.execute(
+        "SELECT 1 FROM cpe_dictionary WHERE keyword = ?", (keyword,)
+    ).fetchone() is not None
+
+
 def search(keyword: str, conn=None, api_key=None, get_fn=requests.get):
     conn = conn or nvd_cache.get_connection()
     _table(conn)
