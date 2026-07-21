@@ -147,6 +147,17 @@ def test_get_scan_command_derives_https_url_from_forwarded_headers():
     assert "don't retry or cancel" in text  # warns about first-call duration so the model waits
 
 
+def test_get_scan_command_tees_instead_of_redirecting():
+    # A `>` redirect swallows the streamed pipeline progress, so the scan looks frozen
+    # for its whole duration. The command must save the report AND stay on screen.
+    ctx = _fake_ctx({"host": "example.test", "x-forwarded-proto": "https"})
+    text = mcp_server.get_scan_command(ctx)
+    assert "Tee-Object -FilePath" in text  # PowerShell
+    assert "| tee reports/" in text        # bash/zsh
+    assert "-sN" in text                   # unbuffered, so stages appear as they happen
+    assert "DO NOT redirect this with `>`" in text
+
+
 def test_get_scan_command_falls_back_to_http_without_proto_header():
     ctx = _fake_ctx({"host": "192.168.1.42:8765"})
     text = mcp_server.get_scan_command(ctx)

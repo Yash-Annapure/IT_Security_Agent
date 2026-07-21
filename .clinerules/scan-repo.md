@@ -6,23 +6,29 @@ do them in order, every time, nothing more:
 
 ## The workflow (this is all of it)
 
-1. **Call the `get_scan_command` MCP tool** (it takes no arguments). It
-   returns one terminal command with the server's current URL filled in.
+1. **Call the `get_scan_command` MCP tool** (it takes no arguments) through
+   your MCP tool-use mechanism. It returns one terminal command with the
+   server's current URL filled in. `get_scan_command` is an MCP tool, not a
+   program: it has no command-line form, no module path, no file on disk.
+   `python -m it_security_agent.get_scan_command` and anything like it will
+   always fail, because there is nothing there to run.
 2. **Run that command in the terminal, exactly as printed.** This machine
    uses Windows PowerShell, so use the `curl.exe` line (plain `curl` does
    NOT work in PowerShell - it's an alias for a different command, and an
    unquoted `@` is a parse error there; the `curl.exe ... "@uv.lock"` line
    avoids both). If the repo's lockfile isn't `uv.lock`, substitute the
    real filename after the `@` - that is the ONLY change you may make.
-   The command streams live pipeline progress (SBOM generation, NVD/KEV
-   sync, CPE cache state, model training, triage) as each stage runs, then
-   prints the report - usually seconds; up to ~2 minutes right after a
-   server restart. Wait for it to finish, don't retry or cancel.
-3. **Save the command's full printed output** to
-   `reports/<YYYY-MM-DD>-scan.md` (create `reports/` if needed) and relay
-   the report to the user in chat. The report ends with a `## Pipeline`
-   section recording which stages ran - keep it, it's part of the report.
-   Done.
+   **Never add a `>` redirect.** The command already ends in
+   `Tee-Object`/`tee`, which both saves the report and lets each pipeline
+   stage appear on screen as it happens; a `>` hides all of it and makes
+   the scan look frozen. Stages stream in - SBOM generation, cache
+   coverage, CPE state, model training, SHAP, triage - then the report.
+   Usually seconds; up to ~2 minutes right after a server restart. Wait
+   for it to finish, don't retry or cancel.
+3. **Relay the full output to the user in chat.** The tee already wrote
+   `reports/<YYYY-MM-DD>-scan.md`, so do not save it again. The report
+   ends with a `## Pipeline` section recording which stages ran - keep it,
+   it's part of the report. Done.
 
 If you are in Cline's Plan mode you cannot use tools - say so and ask the
 user to switch to Act mode instead of re-describing the plan.
@@ -42,9 +48,13 @@ user to switch to Act mode instead of re-describing the plan.
 - **Never modify the command** beyond the lockfile filename - no wrapping
   in `$(...)`, no nesting it inside another command, no piping, no
   reformatting.
-- **Never run scan tooling as a script or module** - no `python
-  scan_repo.py`, `python -m it_security_agent.scan_repo`, `pip install`,
-  `uv sync`, or any install command. Nothing needs installing, ever.
+- **Never run ANY scan tooling as a script, module, or command.** The only
+  terminal command in this entire workflow is the `curl.exe` line that
+  `get_scan_command` hands you in step 2. If you are about to type
+  `python`, `python -m`, `uv run`, `pip install`, or `uv sync` for any
+  reason at all, stop - it is wrong, whatever the module or file name is.
+  This applies to names not listed here: no MCP tool on this server has a
+  command-line equivalent, so there is never a module path worth guessing.
   (`scan_repo.py` files in this repo are deliberate error-stubs, not real
   entry points.)
 - **Never write to or edit any existing file** - not the lockfile, not

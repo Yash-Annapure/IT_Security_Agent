@@ -577,22 +577,33 @@ def get_scan_command(ctx: Context) -> str:
             "base URL - it's the MCP URL in their Cline settings with the trailing /mcp "
             "removed - then run: curl -s -X POST <base-url>/scan --data-binary @uv.lock"
         )
+    # The report path is filled in here rather than left as a placeholder: it removes a
+    # decision from the caller, and it keeps the command a single copy-paste unit that
+    # both shows progress and saves the report.
+    report_path = f"reports/{datetime.date.today():%Y-%m-%d}-scan.md"
     return (
         "Run exactly ONE of these in the terminal, as printed - substituting only the "
         "lockfile filename after the @ if it isn't uv.lock:\n\n"
         f"  Windows PowerShell (use this one on Windows - plain `curl` will NOT work "
-        f"there):\n    curl.exe -s -X POST {base}/scan --data-binary \"@uv.lock\"\n\n"
-        f"  bash / zsh (Linux/macOS):\n    curl -s -X POST {base}/scan --data-binary @uv.lock\n\n"
+        f"there):\n    New-Item -ItemType Directory -Force reports | Out-Null; "
+        f"curl.exe -sN -X POST {base}/scan --data-binary \"@uv.lock\" | "
+        f"Tee-Object -FilePath \"{report_path}\"\n\n"
+        f"  bash / zsh (Linux/macOS):\n    mkdir -p reports && "
+        f"curl -sN -X POST {base}/scan --data-binary @uv.lock | tee {report_path}\n\n"
         "The quotes around \"@uv.lock\" are REQUIRED on PowerShell - an unquoted @ is "
         "a parse error there. Copy them exactly.\n\n"
-        "The command streams live pipeline progress (SBOM generation, NVD/KEV sync, "
-        "CPE cache state, model training, triage) as each stage runs, then prints the "
-        "finished report - usually seconds; up to ~2 minutes on the first run after a "
-        "server restart. Wait for it to finish, don't retry or cancel. Save the FULL "
-        "output to reports/<YYYY-MM-DD>-scan.md and relay it to the user - the report "
-        "ends with a '## Pipeline' section recording exactly which stages ran, which "
-        "is part of the report, not noise to strip. If the user explicitly asked for "
-        "an SBOM, append ?include_sbom=true to the URL."
+        "DO NOT redirect this with `>`. The tee/Tee-Object is deliberate: it writes the "
+        f"report to {report_path} AND lets each pipeline stage appear on screen as it "
+        "happens. A `>` redirect hides all of that, so the scan looks frozen for its "
+        "whole duration. `-N` keeps curl from buffering, for the same reason.\n\n"
+        "You will see stages stream in - SBOM generation, cache coverage, CPE state, "
+        "model training, SHAP, triage - then the finished report; usually seconds, up "
+        "to ~2 minutes on the first run after a server restart. Wait for it to finish, "
+        f"don't retry or cancel. The file is already saved by the time it ends, so do "
+        "not re-save it; just relay the FULL output to the user - the report ends with "
+        "a '## Pipeline' section recording exactly which stages ran, which is part of "
+        "the report, not noise to strip. If the user explicitly asked for an SBOM, "
+        "append ?include_sbom=true to the URL."
     )
 
 
