@@ -34,7 +34,9 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
-from it_security_agent import agent, cpe_dictionary, explain, kev, labeling, matching, model, nvd_cache, repo_scan, sbom
+from it_security_agent import (
+    agent, cpe_dictionary, cwe, explain, kev, labeling, matching, model, nvd_cache, repo_scan, sbom,
+)
 
 load_dotenv()
 
@@ -187,8 +189,18 @@ def parse_lockfile_components(lockfile_content, lockfile_type=None):
     )
 
 
-def prewarm(components, conn, budget_seconds=PREWARM_BUDGET_SECONDS):
+def prewarm(components, conn, budget_seconds=PREWARM_BUDGET_SECONDS, step=None):
     names = sorted({c.name for c in components})
+    if step is not None:
+        # Reported here rather than by the caller so the cache-hit logic lives in one
+        # place - this function already owns it.
+        to_fetch = [n for n in names if not cpe_dictionary.is_cached(n, conn=conn)]
+        if to_fetch:
+            step(f"Prewarming CPE vendor data: {len(names) - len(to_fetch)}/{len(names)} already "
+                 f"cached, fetching up to {len(to_fetch)} from NVD ({budget_seconds}s budget, "
+                 f"{REQUEST_SPACING_SECONDS}s spacing)...")
+        else:
+            step(f"CPE vendor data: all {len(names)} package names already cached (no NVD calls needed)")
     t0 = time.time()
     for name in names:
         # Cache hits make no network request, so they need no rate-limit spacing and
@@ -206,20 +218,31 @@ def prewarm(components, conn, budget_seconds=PREWARM_BUDGET_SECONDS):
         time.sleep(REQUEST_SPACING_SECONDS)
 
 
-def run_pipeline(components, conn):
+def run_pipeline(components, conn, step=None):
     """Train on this scan's own components and triage them, exactly like week3_agent.ipynb.
 
     Returns None if there isn't enough labeled signal to train (e.g. too few
     components, or registry lookups all came back empty) - callers should
     fall back to raw_matches() in that case.
+
+    `step` is an optional progress callback (see _run_scan) - each stage reports
+    through it so callers can surface what the pipeline is doing.
     """
+    def report(message):
+        if step is not None:
+            step(message)
+
     dataset = labeling.build_dataset(components, conn=conn)
     if dataset.empty or dataset["label_real_match"].nunique() < 2:
         return None
+    report(f"Built training set: {len(dataset)} candidate matches, {len(labeling.FEATURES)} features")
+    report("Training + comparing LogisticRegression vs RandomForest (risk weighting FN x10 + FP x1)...")
     model.train_and_compare(dataset, model_dir=MODEL_DIR)
     winner_name, winning_model, threshold = model.load_winning_model(model_dir=MODEL_DIR)
+    report(f"Winning model: {winner_name} (decision threshold {threshold:.2f})")
     background = dataset[labeling.FEATURES].astype(float)
     explainer = explain.make_explainer(winner_name, winning_model, background)
+    report("Built SHAP explainer - scoring every match and applying the triage policy...")
     return agent.scan(components, winner_name, winning_model, threshold, explainer, conn=conn)
 
 
@@ -250,25 +273,109 @@ def format_summary(result, meta: dict) -> str:
         f"- rejected (name matched, ruled out by version or vendor): {len(result.rejected)}",
     ]
 
-    def _line(f):
-        conf = f"{f.confidence:.2f}" if f.confidence is not None else "n/a"
-        return (f"  - {f.component.name} {f.component.version} ({f.component.ecosystem}): {f.cve} "
-                f"severity={f.severity} cvss={f.cvss_score} confidence={conf} corroboration={f.corroboration}")
-
     if result.escalated:
-        lines += ["", "## Escalated - fix these first"] + [_line(f) for f in result.escalated]
+        lines += ["", "## Escalated - fix these first",
+                  "_Actively exploited in the wild right now, per CISA's Known Exploited "
+                  "Vulnerabilities catalog. These are not theoretical._"]
+        lines += [_detail_block(f) for f in result.escalated]
     if result.confirmed:
-        lines += ["", "## Confirmed"] + [_line(f) for f in result.confirmed]
+        lines += ["", "## Confirmed",
+                  "_The model was confident these are real matches for your pinned "
+                  "versions (or OSV.dev independently agreed)._"]
+        lines += [_detail_block(f) for f in result.confirmed]
     if result.review_queue:
-        lines += ["", "## Needs human review"]
-        for f in result.review_queue:
-            lines.append(_line(f))
-            if f.explanation:
-                top = sorted(f.explanation.items(), key=lambda kv: -abs(kv[1]))[:3]
-                lines.append("    top factors: " + ", ".join(f"{k}={v:+.2f}" for k, v in top))
+        lines += ["", "## Needs human review",
+                  "_The model wasn't confident enough to call these either way - a person "
+                  "should look. The 'why the model hesitated' factors are SHAP values: how "
+                  "much each signal pushed the score up (+) or down (-)._"]
+        lines += [_detail_block(f) for f in result.review_queue]
     if not (result.escalated or result.confirmed or result.review_queue):
         lines += ["", "No vulnerabilities found in the scanned components."]
     return "\n".join(lines)
+
+
+def _severity_in_plain_terms(f) -> str:
+    """One sentence a non-specialist can act on, built from what we actually know."""
+    parts = []
+    if f.kev_hit:
+        parts.append("**Attackers are exploiting this right now** (it's in CISA's "
+                     "actively-exploited catalog) - treat it as urgent, not theoretical")
+    score = f.cvss_score
+    if score is not None:
+        if score >= 9.0:
+            parts.append(f"rated {score}/10, which is about as severe as vulnerabilities get")
+        elif score >= 7.0:
+            parts.append(f"rated {score}/10 - serious, worth fixing soon")
+        elif score >= 4.0:
+            parts.append(f"rated {score}/10 - moderate; fix it, but it's not an emergency")
+        else:
+            parts.append(f"rated {score}/10 - low severity")
+    else:
+        parts.append("NVD hasn't published a severity score for this one yet")
+
+    flaw_notes = [note for note in (cwe.plain_explanation(c) for c in f.cwe_ids) if note]
+    if flaw_notes:
+        parts.append(f"the underlying flaw is that {flaw_notes[0]}")
+
+    if f.corroboration == "osv_agrees":
+        parts.append("OSV.dev independently reports a vulnerability for this exact "
+                     "package version too, which is a good sign the match is real")
+    elif f.corroboration == "osv_disagrees":
+        parts.append("OSV.dev does *not* list a vulnerability for this exact version, "
+                     "so this may be a false alarm worth checking by hand")
+
+    sentence = "; ".join(parts)
+    return sentence[0].upper() + sentence[1:] + "." if sentence else ""
+
+
+def _detail_block(f) -> str:
+    """Full per-finding write-up: plain-English first, then the technical specifics."""
+    c = f.component
+    out = [
+        "",
+        f"### {c.name} {c.version} ({c.ecosystem}) - {f.cve}",
+        "",
+        f"**What this means:** {_severity_in_plain_terms(f)}",
+        "",
+        f"**Fix:** upgrade `{c.name}` to a version newer than {c.version}, or apply the "
+        f"vendor's patch - check the NVD link below for the fixed version range.",
+        "",
+    ]
+
+    facts = [f"- **Severity:** {f.severity}" + (f" (CVSS {f.cvss_score}/10)" if f.cvss_score is not None else "")]
+    if f.cwe_ids:
+        named = []
+        for cwe_id in f.cwe_ids:
+            link = cwe.url(cwe_id)
+            name = cwe.technical_name(cwe_id)
+            # technical_name() falls back to the bare ID when unmapped - don't print
+            # it twice ("CWE-640 CWE-640") in that case.
+            label = cwe_id if name == cwe_id else f"{cwe_id} {name}"
+            named.append(f"[{label}]({link})" if link else label)
+        facts.append(f"- **Weakness type:** {', '.join(named)}")
+    if f.confidence is not None:
+        facts.append(f"- **Model confidence:** {f.confidence:.2f} "
+                     f"({'above' if f.model_confident else 'below'} the decision threshold)")
+    facts.append(f"- **OSV.dev cross-check:** {f.corroboration.replace('_', ' ')}")
+    if f.vendor:
+        facts.append(f"- **Matched NVD vendor:** `{f.vendor}` (the CPE vendor whose product "
+                     f"entry matched this package)")
+    if f.note:
+        facts.append(f"- **Note:** {f.note}")
+    facts.append(f"- **Full record:** https://nvd.nist.gov/vuln/detail/{f.cve}")
+    out += facts
+
+    if f.description:
+        text = f.description.strip()
+        if len(text) > 900:  # NVD descriptions are usually short; a few run very long
+            text = text[:900].rstrip() + " [...truncated - see the NVD link above for the full text]"
+        out += ["", "**Technical description (verbatim from NVD):**", "", f"> {text}"]
+
+    if f.explanation:
+        top = sorted(f.explanation.items(), key=lambda kv: -abs(kv[1]))[:3]
+        out += ["", "**Why the model hesitated (top SHAP factors):** "
+                + ", ".join(f"`{k}` {v:+.2f}" for k, v in top)]
+    return "\n".join(out)
 
 
 def format_raw_matches(found: list, meta: dict) -> str:
@@ -383,13 +490,14 @@ def get_scan_command(ctx: Context) -> str:
         f"  bash / zsh (Linux/macOS):\n    curl -s -X POST {base}/scan --data-binary @uv.lock\n\n"
         "The quotes around \"@uv.lock\" are REQUIRED on PowerShell - an unquoted @ is "
         "a parse error there. Copy them exactly.\n\n"
-        "The command streams: it first prints a 'Scanning' line and keepalive dots "
-        "while the server works (usually seconds; up to ~2 minutes on the first run "
-        "after a server restart) - wait for it to finish, don't retry or cancel. "
-        "Everything printed after the dots is the finished vulnerability report - "
-        "save the full output to reports/<YYYY-MM-DD>-scan.md and relay the report "
-        "to the user. If the user explicitly asked for an SBOM, append "
-        "?include_sbom=true to the URL."
+        "The command streams live pipeline progress (SBOM generation, NVD/KEV sync, "
+        "CPE cache state, model training, triage) as each stage runs, then prints the "
+        "finished report - usually seconds; up to ~2 minutes on the first run after a "
+        "server restart. Wait for it to finish, don't retry or cancel. Save the FULL "
+        "output to reports/<YYYY-MM-DD>-scan.md and relay it to the user - the report "
+        "ends with a '## Pipeline' section recording exactly which stages ran, which "
+        "is part of the report, not noise to strip. If the user explicitly asked for "
+        "an SBOM, append ?include_sbom=true to the URL."
     )
 
 
@@ -576,26 +684,65 @@ def scan_repo(
 
 
 def _run_scan(lockfile_content: str, lockfile_type: str = "", max_components: int = 40,
-              include_sbom: bool = False) -> str:
+              include_sbom: bool = False, progress=None) -> str:
     """The actual scan pipeline, shared by the scan_repo MCP tool and the /scan HTTP
-    endpoint - parse, generate SBOM, sync caches, match, triage, format."""
+    endpoint - parse, generate SBOM, sync caches, match, triage, format.
+
+    `progress` is an optional callable taking one string. Every pipeline stage reports
+    through it as it happens, so a streaming caller can show live what the scan is
+    doing (rather than an opaque wait), and the same log is appended to the finished
+    report so the saved artifact records exactly which stages ran.
+    """
+    t0 = time.time()
+    log: list[str] = []
+
+    def step(message: str) -> None:
+        line = f"[{time.time() - t0:5.1f}s] {message}"
+        log.append(line)
+        if progress is not None:
+            progress(line)
+
     components = parse_lockfile_components(lockfile_content, lockfile_type)
     if not components:
         return "No components could be parsed from the provided lockfile."
+    kind = lockfile_type or _detect_lockfile_type(lockfile_content)
+    ecosystems = sorted({c.ecosystem for c in components})
+    step(f"Parsed {len(components)} components from {kind} ({', '.join(ecosystems)})")
 
     generated_bom = sbom.to_cyclonedx(components, bom_name="scan_repo")
+    sbom_note = "included in report below" if include_sbom else "not included (add ?include_sbom=true to include)"
+    step(f"Generated CycloneDX {generated_bom['specVersion']} SBOM from the lockfile, "
+         f"{len(generated_bom['components'])} components - {sbom_note}")
 
     total = len(components)
     truncated = total > max_components
     components = components[:max_components]
     meta = {"scanned": len(components), "total": total, "truncated": truncated, "max_components": max_components}
+    if truncated:
+        step(f"Capped to first {len(components)} of {total} components (max_components={max_components})")
 
     conn = get_connection()
-    _ensure_synced(conn)
-    prewarm(components, conn)
+    if time.time() - _last_synced < SYNC_INTERVAL_SECONDS:
+        step("NVD CVE catalog + CISA KEV feed already synced (cached, <6h old)")
+    else:
+        step("Syncing NVD CVE catalog + CISA KEV feed (first sync takes 1-2 min)...")
+        _ensure_synced(conn)
+        step("NVD + KEV sync complete")
 
-    result = run_pipeline(components, conn)
-    text = format_raw_matches(raw_matches(components, conn), meta) if result is None else format_summary(result, meta)
+    prewarm(components, conn, step=step)
+
+    step("Matching components against NVD (name + version + vendor), cross-checking OSV.dev...")
+    result = run_pipeline(components, conn, step=step)
+    if result is None:
+        step("Not enough labeled signal to train a confidence model - falling back to untriaged raw matches")
+        text = format_raw_matches(raw_matches(components, conn), meta)
+    else:
+        step(f"Triaged: {len(result.escalated)} escalated (CISA KEV), {len(result.confirmed)} confirmed, "
+             f"{len(result.review_queue)} need review, {len(result.rejected)} rejected as collisions")
+        text = format_summary(result, meta)
+
+    step("Done")
+    text += "\n\n## Pipeline (what this scan actually ran)\n\n```\n" + "\n".join(log) + "\n```"
 
     if include_sbom:
         text += format_sbom_section(generated_bom)
@@ -646,7 +793,10 @@ async def scan_http_endpoint(request):
 
     include_sbom = request.query_params.get("include_sbom", "").lower() in ("true", "1", "yes")
 
+    import queue
+
     outcome = {}
+    updates: "queue.Queue[str]" = queue.Queue()
 
     def work():
         try:
@@ -654,18 +804,34 @@ async def scan_http_endpoint(request):
             # primary path and every package in the lockfile gets scanned. Streaming
             # keeps the connection alive however long that takes, so there's no
             # latency ceiling forcing a cap anymore.
-            outcome["report"] = _run_scan(text, "", len(components), include_sbom)
+            outcome["report"] = _run_scan(text, "", len(components), include_sbom,
+                                          progress=updates.put)
         except Exception as exc:
             outcome["error"] = str(exc)
 
     async def stream():
         worker = threading.Thread(target=work, daemon=True)
         worker.start()
-        yield b"Scanning (dots are keepalive progress - the report follows when done)\n"
+        yield b"Scanning - live pipeline progress follows, then the report:\n\n"
+
+        def drain():
+            out = []
+            while True:
+                try:
+                    out.append(updates.get_nowait())
+                except queue.Empty:
+                    return out
+
+        # Relay progress lines as they happen. Each one is also a keepalive byte,
+        # which is what stops proxies (Cloudflare's ~100s cap) from timing us out.
         while worker.is_alive():
-            await anyio.sleep(5)
-            yield b"."
-        yield b"\n\n"
+            for line in drain():
+                yield (line + "\n").encode("utf-8")
+            await anyio.sleep(0.5)
+        for line in drain():  # anything logged between the last poll and thread exit
+            yield (line + "\n").encode("utf-8")
+
+        yield b"\n"
         # Both branches end with a newline: without one, terminal integrations glue
         # their own shell-prompt artifacts onto the report's last line.
         if "error" in outcome:

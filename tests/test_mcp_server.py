@@ -231,6 +231,39 @@ def test_scan_http_endpoint_scans_every_component_with_no_cap():
     assert "capped by max_components" not in resp.text
 
 
+def test_scan_http_endpoint_streams_live_pipeline_progress():
+    # Transparency: the user should see the real stages (SBOM generation, sync state,
+    # CPE cache state, matching, triage) as they happen - not an opaque wait.
+    with patch.object(mcp_server, "get_connection", return_value="conn"), \
+         patch.object(mcp_server, "_ensure_synced"), \
+         patch.object(mcp_server, "prewarm"), \
+         patch.object(mcp_server, "run_pipeline", return_value=None), \
+         patch.object(mcp_server, "raw_matches", return_value=[]):
+        resp = _http_client().post("/scan", content=UV_LOCK_TEXT.encode("utf-8"))
+    assert resp.status_code == 200
+    for expected in ("Parsed 1 components", "Generated CycloneDX", "SBOM",
+                     "Matching components against NVD", "## Pipeline"):
+        assert expected in resp.text, f"missing progress detail: {expected}"
+
+
+def test_run_pipeline_reports_model_training_details_through_step():
+    two_class_df = pd.DataFrame([
+        {**{f: 0.0 for f in mcp_server.labeling.FEATURES}, "label_real_match": True},
+        {**{f: 1.0 for f in mcp_server.labeling.FEATURES}, "label_real_match": False},
+    ])
+    seen = []
+    with patch.object(mcp_server.labeling, "build_dataset", return_value=two_class_df), \
+         patch.object(mcp_server.model, "train_and_compare"), \
+         patch.object(mcp_server.model, "load_winning_model", return_value=("RandomForest", object(), 0.42)), \
+         patch.object(mcp_server.explain, "make_explainer", return_value=object()), \
+         patch.object(mcp_server.agent, "scan", return_value="result"):
+        mcp_server.run_pipeline([], conn=None, step=seen.append)
+    joined = "\n".join(seen)
+    assert "LogisticRegression vs RandomForest" in joined  # the model comparison is visible
+    assert "RandomForest (decision threshold 0.42)" in joined  # and which one won
+    assert "SHAP" in joined
+
+
 def _http_client():
     # The /condense custom route is registered on the same ASGI app the real server
     # runs (streamable-http transport), so testing through that app exercises the
@@ -363,9 +396,11 @@ def test_scan_repo_returns_triaged_summary_when_pipeline_succeeds():
          patch.object(mcp_server, "prewarm"), \
          patch.object(mcp_server, "run_pipeline", return_value=sentinel_result):
         text = mcp_server.scan_repo(lockfile_content=UV_LOCK_TEXT, include_sbom=False)
-    assert text == mcp_server.format_summary(sentinel_result, {
+    assert text.startswith(mcp_server.format_summary(sentinel_result, {
         "scanned": 1, "total": 1, "truncated": False, "max_components": 40,
-    })
+    }))
+    # Every report also records which pipeline stages actually ran, for transparency.
+    assert "## Pipeline (what this scan actually ran)" in text
 
 
 def test_scan_repo_omits_generated_sbom_by_default():
@@ -563,8 +598,63 @@ def test_format_summary_includes_escalated_and_review_queue_sections():
     assert "CVE-ESCALATED" in text
     assert "CVE-CONFIRMED" in text
     assert "CVE-REVIEW" in text
-    assert "top factors:" in text
+    assert "top SHAP factors" in text
     assert "Scanned" not in text  # not truncated, so no truncation note
+
+
+def test_format_summary_explains_findings_in_both_plain_and_technical_terms():
+    f = _finding(cve="CVE-2019-19844")
+    f.severity = "CRITICAL"
+    f.cvss_score = 9.8
+    f.kev_hit = True
+    f.cwe_ids = ["CWE-640", "CWE-79"]
+    f.vendor = "djangoproject"
+    f.description = "Django before 1.11.27 allows account takeover via a crafted password reset."
+    text = mcp_server.format_summary(ScanResult(escalated=[f]), {
+        "scanned": 1, "total": 1, "truncated": False, "max_components": 40,
+    })
+
+    # Layman's layer: what it means and what to do, without jargon.
+    assert "**What this means:**" in text
+    assert "exploiting this right now" in text  # KEV status in plain words
+    assert "as severe as vulnerabilities get" in text  # 9.8 explained, not just printed
+    # The plain-English line explains the primary (first) weakness; all of them still
+    # appear in the technical "Weakness type" line below.
+    assert "'forgot password' flow can be abused" in text  # CWE-640 in plain words
+    assert "**Fix:**" in text
+
+    # Technical layer: the specifics a practitioner needs.
+    assert "CVSS 9.8/10" in text
+    assert "Cross-site Scripting (XSS)" in text  # CWE technical name
+    assert "cwe.mitre.org/data/definitions/79.html" in text  # and a link to the definition
+    assert "djangoproject" in text  # which NVD vendor matched
+    assert "Django before 1.11.27" in text  # verbatim NVD description
+    assert "https://nvd.nist.gov/vuln/detail/CVE-2019-19844" in text
+
+
+def test_format_summary_handles_findings_with_no_enrichment_data():
+    # Older/rejected findings can lack description, CWEs and score entirely - the
+    # report must still render rather than blowing up on a missing field.
+    f = _finding(cve="CVE-BARE")
+    f.cvss_score = None
+    f.cwe_ids = []
+    f.description = ""
+    f.vendor = ""
+    text = mcp_server.format_summary(ScanResult(confirmed=[f]), {
+        "scanned": 1, "total": 1, "truncated": False, "max_components": 40,
+    })
+    assert "CVE-BARE" in text
+    assert "hasn't published a severity score" in text
+
+
+def test_format_summary_truncates_very_long_nvd_descriptions():
+    f = _finding(cve="CVE-LONG")
+    f.description = "x" * 2000
+    text = mcp_server.format_summary(ScanResult(confirmed=[f]), {
+        "scanned": 1, "total": 1, "truncated": False, "max_components": 40,
+    })
+    assert "truncated - see the NVD link" in text
+    assert len(text) < 2000  # the 2000-char description didn't land whole
 
 
 def test_format_summary_notes_truncation():

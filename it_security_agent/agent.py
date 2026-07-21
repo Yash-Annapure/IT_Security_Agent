@@ -19,6 +19,12 @@ class Finding:
     kev_hit: bool = False
     note: str = ""
     model_confident: bool = False
+    # Carried through from matching.find_candidates so reports can explain what the
+    # vulnerability actually *is*, not just cite its ID. matching already extracts
+    # both from the NVD record; dropping them here would mean re-querying to report.
+    description: str = ""
+    cwe_ids: list = field(default_factory=list)
+    vendor: str = ""
 
 
 @dataclass
@@ -55,6 +61,8 @@ def triage_component(component, winning_model_name, winning_model, threshold, ex
             result.rejected.append(Finding(
                 component=component, cve=finding_data["cve"], severity=finding_data["severity"],
                 cvss_score=finding_data["cvss_score"],
+                description=finding_data.get("description", ""),
+                cwe_ids=finding_data.get("cwe_ids", []), vendor=finding_data.get("vendor", ""),
             ))
             continue
 
@@ -82,6 +90,8 @@ def triage_component(component, winning_model_name, winning_model, threshold, ex
             component=component, cve=finding_data["cve"], severity=finding_data["severity"],
             cvss_score=finding_data["cvss_score"], confidence=confidence, kev_hit=bool(kev_entry),
             corroboration=corroboration, model_confident=model_confident,
+            description=finding_data.get("description", ""),
+            cwe_ids=finding_data.get("cwe_ids", []), vendor=finding_data.get("vendor", ""),
         )
 
         if confidence >= threshold or corroboration == "osv_agrees":

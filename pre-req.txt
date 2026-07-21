@@ -1,3 +1,7 @@
+One-time per machine (makes scans near-instant afterwards):
+uv run warm_cache.py
+
+Every boot:
 uv run serve.py (For mcp)
 uv run serve_mistral.py (For model)
 
@@ -6,4 +10,4 @@ Cloudlfare tunnel
 ./cloudflared tunnel --url http://localhost:8000
 ./cloudflared tunnel --url http://localhost:8765
 
-model:id Qwen/Qwen2.5-7B-Instruct
+model:id Qwen/Qwen2.5-14B-Instruct

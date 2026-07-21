@@ -40,6 +40,34 @@ recommended - without it every NVD/CPE request is spaced 6s apart instead of
 1s, and the initial sync (Section 2 of the notebook, or the MCP server's
 first `scan_repo` call) takes several times longer.
 
+### Warm the cache once (recommended - makes scans near-instant)
+
+```
+uv run warm_cache.py
+```
+
+Pre-populates `nvd_cache.db` with the NVD CVE window, the CISA KEV feed, and
+CPE vendor data for every package in your lockfile(s), so scans afterwards
+hit the local cache instead of the network. Worth doing once per machine
+right after `uv sync`.
+
+This matters because CPE vendor lookups are the slowest part of a scan and
+NVD rate-limits them (1s/request with an API key, 6s without). The server
+prewarms them inside each scan under a 90s budget, so a large lockfile
+converges over several scans; this script does the same fetching with no
+budget cap and no timeout pressure, and prints per-package progress with an
+up-front ETA. On this repo (151 unique names) that's ~2.5 minutes with an
+API key, once - after which every name is a cache hit.
+
+```
+uv run warm_cache.py path/to/uv.lock path/to/package-lock.json   # specific files
+uv run warm_cache.py --days 90     # widen the CVE window (default 14 days)
+uv run warm_cache.py --full        # pull NVD's entire CVE catalog (slow, rarely needed)
+```
+
+Re-run it occasionally to pick up newly published CVEs. It's incremental -
+already-cached names are skipped, so a re-run only fetches what's new.
+
 ## Plug-and-play: expose this as an MCP tool for Cline + a self-hosted model
 
 This repo ships an MCP server (`it_security_agent/mcp_server.py`) with one
@@ -146,8 +174,38 @@ actions, and `.clinerules/` walks the model through them:
 1. Call the `get_scan_command` MCP tool (no arguments) - it returns one
    terminal command with the server's current URL filled in.
 2. Run that command - it POSTs the lockfile straight from disk to the
-   server's `/scan` endpoint and prints back the finished triaged report.
+   server's `/scan` endpoint, streams live pipeline progress as each stage
+   runs, and prints the finished triaged report.
 3. Save the printed report to `reports/<date>-scan.md`.
+
+The stream is the transparency layer: rather than an opaque wait, you watch
+the actual pipeline work - components parsed, CycloneDX SBOM generated,
+NVD/KEV sync state, how many package names were already CPE-cached vs
+fetched, LogisticRegression-vs-RandomForest training and which model won at
+what threshold, SHAP explainer construction, and the final triage counts.
+The same log is appended to the saved report as a `## Pipeline` section, so
+every report is a record of exactly which stages ran and how long each took.
+
+### What a finding looks like
+
+Every finding is written up twice over, so the report serves both a
+non-specialist and a practitioner:
+
+- **"What this means"** - one plain-English paragraph: whether it's being
+  actively exploited right now (CISA KEV), what the CVSS score means in
+  words rather than as a bare number, what kind of flaw it is (the CWE
+  translated out of jargon - "an attacker can run their own scripts in
+  another user's browser" rather than "CWE-79"), and whether OSV.dev
+  independently agreed. Followed by a concrete **Fix** line.
+- **The technical specifics** - severity and CVSS, CWE IDs with their
+  proper names linked to MITRE, model confidence against the decision
+  threshold, the OSV cross-check result, which NVD CPE vendor matched, the
+  verbatim NVD description, and a link to the full record. For anything in
+  the review queue, the top SHAP factors showing *why* the model hesitated.
+
+The CWE translations live in `it_security_agent/cwe.py` (the CWE Top 25 plus
+common library-level flaws); an unmapped ID degrades to the bare identifier
+and its MITRE link rather than breaking the report.
 
 If you ask for "an SBOM," the model appends `?include_sbom=true` to the
 scan URL and a real CycloneDX document (not a description of one) comes

@@ -14,12 +14,15 @@ do them in order, every time, nothing more:
    unquoted `@` is a parse error there; the `curl.exe ... "@uv.lock"` line
    avoids both). If the repo's lockfile isn't `uv.lock`, substitute the
    real filename after the `@` - that is the ONLY change you may make.
-   The command streams: it prints a "Scanning" line and keepalive dots
-   while the server works (usually seconds; up to ~2 minutes right after a
-   server restart) - wait for it to finish, don't retry or cancel.
+   The command streams live pipeline progress (SBOM generation, NVD/KEV
+   sync, CPE cache state, model training, triage) as each stage runs, then
+   prints the report - usually seconds; up to ~2 minutes right after a
+   server restart. Wait for it to finish, don't retry or cancel.
 3. **Save the command's full printed output** to
    `reports/<YYYY-MM-DD>-scan.md` (create `reports/` if needed) and relay
-   the report to the user in chat. Done.
+   the report to the user in chat. The report ends with a `## Pipeline`
+   section recording which stages ran - keep it, it's part of the report.
+   Done.
 
 If you are in Cline's Plan mode you cannot use tools - say so and ask the
 user to switch to Act mode instead of re-describing the plan.
