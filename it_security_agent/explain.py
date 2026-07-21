@@ -10,11 +10,8 @@ def make_explainer(model_name: str, model, background):
 
 
 def _positive_class(shap_values):
-    """Slice a binary classifier's SHAP output down to the "real match" class.
-
-    TreeExplainer returns (n_samples, n_features, n_classes); older versions and
-    LinearExplainer return a list per class or a plain 2D array.
-    """
+    """Slice to the "real match" class. TreeExplainer returns (n_samples, n_features,
+    n_classes); older versions and LinearExplainer return a per-class list or a 2D array."""
     if isinstance(shap_values, list):
         return shap_values[1]
     if getattr(shap_values, "ndim", 2) == 3:
@@ -27,12 +24,7 @@ def explain_match(explainer, row) -> dict:
 
 
 def explain_matches(explainer, rows) -> list:
-    """SHAP contributions for a whole DataFrame of candidates, one explainer call.
-
-    The agent explains every review-queue finding, and SHAP costs ~16ms a row either
-    way - the tree walk itself dominates, not call overhead - so this mainly avoids
-    re-entering the explainer once per finding.
-    """
+    """SHAP contributions for a DataFrame of candidates in one explainer call."""
     if len(rows) == 0:
         return []
     values = _positive_class(explainer.shap_values(rows))

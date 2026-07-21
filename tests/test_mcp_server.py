@@ -313,6 +313,19 @@ def test_ensure_synced_skips_when_recent():
         mcp_server._last_synced = 0.0
 
 
+def test_a_complete_cache_scans_offline_without_syncing():
+    # A warmed cache is the whole point of warm_cache.py: if the catalog is already
+    # local, a scan must not reach for the network at all.
+    with patch.object(mcp_server, "get_connection", return_value="conn"), \
+         patch.object(mcp_server, "_cache_coverage", return_value=dict(FULL_CACHE)), \
+         patch.object(mcp_server, "_ensure_synced") as mock_sync, \
+         patch.object(mcp_server, "prewarm"), \
+         patch.object(mcp_server, "run_pipeline", return_value=ScanResult()):
+        text = mcp_server.scan_repo(lockfile_content=UV_LOCK_TEXT, include_sbom=False)
+    mock_sync.assert_not_called()
+    assert "scanning offline, no NVD sync needed" in text
+
+
 def test_ensure_synced_syncs_when_stale():
     mcp_server._last_synced = 0.0
     try:
@@ -626,7 +639,7 @@ def test_clean_result_on_a_thin_cache_is_not_reported_as_clean():
 def test_clean_result_on_a_full_cache_carries_no_coverage_warning():
     text = mcp_server.format_summary(ScanResult(), _meta(FULL_CACHE))
     assert "not a clean bill of health" not in text
-    assert "365,000 CVEs" in text
+    assert "365,000 cached CVEs" in text
 
 
 def test_findings_on_a_thin_cache_are_marked_a_lower_bound():
@@ -642,7 +655,7 @@ def test_format_summary_states_the_flagging_policy():
     assert "## How these were flagged" in text
     assert "random_forest" in text and "0.15" in text
     assert "26,856" in text
-    assert f"{mcp_server.model.FN_WEIGHT}x as costly" in text
+    assert f"{mcp_server.model.FN_WEIGHT}x a false alarm" in text
     for bucket in ("escalated", "confirmed", "review_queue", "rejected"):
         assert f"**{bucket}**" in text
 

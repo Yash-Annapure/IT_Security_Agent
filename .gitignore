@@ -7,6 +7,8 @@ docs/superpowers/specs/
 week1-explainer.md
 .claude
 nvd_cache.db
+nvd_cache.db-wal
+nvd_cache.db-shm
 *.joblib
 reports/
 .coverage

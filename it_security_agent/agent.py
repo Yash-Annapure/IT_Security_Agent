@@ -50,9 +50,8 @@ def triage_component(component, winning_model_name, winning_model, threshold, ex
                      kev_ids=None):
     """Triage one component's candidate matches into the four buckets.
 
-    `kev_ids` is an optional preloaded set of known-exploited CVE ids (see
-    kev.load_kev_ids). scan() passes one so a whole run does a single KEV read;
-    callers that triage a component on its own can omit it and pay per-CVE lookups.
+    `kev_ids` is an optional preloaded set (kev.load_kev_ids) so a whole scan does one
+    KEV read; omit it to triage a component standalone and pay per-CVE lookups.
     """
     result = ScanResult()
     matches, rejected_ids = matching.find_candidates(component, conn=conn)
@@ -76,10 +75,8 @@ def triage_component(component, winning_model_name, winning_model, threshold, ex
     if not scored:
         return result
 
-    # OSV is keyed on (ecosystem, name, version) - the component, not the match - so one
-    # query answers every candidate CVE for this component. It used to run per finding,
-    # which on a component whose OSV entry wasn't cached yet meant one network round trip
-    # per candidate rather than one per component.
+    # OSV is keyed on the component, not the match, so one query answers every candidate
+    # CVE here - per-finding it was a network round trip per candidate on a cache miss.
     osv_vulns = (
         osv.query(component.ecosystem, component.name, component.version, conn=conn)
         if component.ecosystem in OSV_ECOSYSTEMS else []

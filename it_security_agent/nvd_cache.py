@@ -9,25 +9,17 @@ DB_PATH = Path(__file__).resolve().parent.parent / "nvd_cache.db"
 
 # Bump when _products_in() changes what it extracts, to force a rebuild of cve_products.
 PRODUCT_INDEX_VERSION = 1
-# The server opens this cache from more than one place at once: the request path holds a
-# connection while _start_background_sync() writes NVD/KEV updates from a daemon thread.
-# SQLite's 5s default busy timeout is shorter than either a catalog sync or a one-time
-# product-index backfill over ~365k CVEs, so a concurrent writer used to fail outright
-# with "database is locked" instead of waiting its turn.
+# Longer than a catalog sync or a product-index backfill, so the server's request path
+# and its background sync thread wait for each other instead of failing "database is
+# locked" on SQLite's 5s default.
 BUSY_TIMEOUT_SECONDS = 180
 
 
-def get_connection(db_path=None, index_progress=None):
+def get_connection(db_path=None):
     conn = sqlite3.connect(db_path or DB_PATH, timeout=BUSY_TIMEOUT_SECONDS)
-    # WAL lets the scan path keep reading while the background sync writes - under the
-    # default rollback journal a writer blocks every reader for the length of its
-    # transaction, which on this workload means a sync stalling live scans.
-    #
-    # Switching journal mode needs a brief exclusive lock that the busy timeout does NOT
-    # cover, so a connection opened while another holds a write transaction would fail
-    # here with "database is locked". The mode is persistent once set and is a
-    # performance setting rather than a correctness one, so check first and let a
-    # contended attempt pass: the next open converts it.
+    # WAL keeps readers unblocked while the sync thread writes. Setting the mode needs a
+    # brief exclusive lock the busy timeout does NOT cover, so check first and let a
+    # contended attempt pass - it's a performance setting, and the next open converts it.
     try:
         if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
             conn.execute("PRAGMA journal_mode=WAL")
@@ -40,14 +32,10 @@ def get_connection(db_path=None, index_progress=None):
         )"""
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_cves_modified ON cves(last_modified)")
-    # Inverted index: CPE product name -> CVE id. query_by_product_name() used to be a
-    # `raw_json LIKE '%:name:%'` scan, whose cost is proportional to the *whole table's*
-    # bytes and so grew with cache coverage - measured 0.4s per call over a 234MB/42k-CVE
-    # cache, and matching calls it once per name variant per component (~300x a scan).
-    # At full catalog coverage (~365k CVEs, ~1.7GB) that is 15+ minutes of disk scanning
-    # per scan, and on a small-RAM host the table can't stay in page cache so every call
-    # re-reads it. WITHOUT ROWID makes the (product, cve_id) primary key itself the
-    # lookup structure, so a product probe is a B-tree seek rather than a table scan.
+    # Inverted index: CPE product -> CVE id. query_by_product_name() was a
+    # `raw_json LIKE '%:name:%'` scan costing time proportional to the whole table, run
+    # ~300x a scan; over a 2GB cache that is 15+ minutes. WITHOUT ROWID makes the primary
+    # key itself the lookup structure, so a probe is a B-tree seek, not a table scan.
     conn.execute(
         """CREATE TABLE IF NOT EXISTS cve_products (
             product TEXT NOT NULL, cve_id TEXT NOT NULL, PRIMARY KEY (product, cve_id)
@@ -55,18 +43,15 @@ def get_connection(db_path=None, index_progress=None):
     )
     conn.execute("CREATE TABLE IF NOT EXISTS cache_meta (key TEXT PRIMARY KEY, value TEXT)")
     conn.commit()
-    # Caches built before cve_products existed are backfilled on first open rather than
-    # in the scan path: correctness of query_by_product_name depends on the index being
-    # complete, so it must not be possible to open this cache and query it unindexed.
-    ensure_product_index(conn, on_progress=index_progress)
+    # Correctness of query_by_product_name depends on the index being complete, so it
+    # must not be possible to open this cache and query it unindexed.
+    ensure_product_index(conn)
     return conn
 
 
 def _products_in(item) -> set:
-    """Every CPE product name (field 4 of the CPE 2.3 URI) referenced by one CVE record.
-
-    Lower-cased to match matching.name_variants(), which lower-cases before comparing.
-    """
+    """CPE product names (field 4 of the CPE 2.3 URI) a CVE names, lower-cased to match
+    matching.name_variants()."""
     products = set()
     for group in item.get("cve", {}).get("configurations") or []:
         for node in group.get("nodes", []):
@@ -110,17 +95,13 @@ def _index_is_current(conn) -> bool:
 def ensure_product_index(conn, on_progress=None, batch_size=5000) -> int:
     """Backfill cve_products for a cache populated before the index existed.
 
-    Idempotent and cheap once built (one indexed read of cache_meta). The marker is
-    written only in the same transaction as the rows, so an interrupted run rebuilds
-    from scratch next time rather than leaving a half-filled index that looks complete -
-    a silently partial index would under-report vulnerabilities, which is the one
-    failure mode this cache must never have.
+    The version marker is written in the same transaction as the rows, so an interrupted
+    run rebuilds next time rather than leaving a partial index that looks complete - a
+    silently partial index would under-report vulnerabilities.
 
-    Concurrency matters here because the server opens this cache from the request path
-    and from the background sync thread at the same time. BEGIN IMMEDIATE makes the
-    backfill mutually exclusive: whichever connection gets there first does the work,
-    and the other blocks (up to BUSY_TIMEOUT_SECONDS), then re-checks the marker inside
-    the lock and returns having done nothing, rather than duplicating a long rebuild.
+    BEGIN IMMEDIATE makes the backfill mutually exclusive, since the server opens this
+    cache from the request path and the sync thread at once: the winner does the work,
+    the loser blocks, re-checks inside the lock, and returns having done nothing.
     """
     if _index_is_current(conn):
         return 0

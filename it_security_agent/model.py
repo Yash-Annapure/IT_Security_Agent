@@ -81,13 +81,8 @@ def predict_confidence(model, candidate_signals: dict) -> float:
 
 
 def predict_confidence_batch(model, candidate_signals: list) -> list:
-    """Score many candidates in one predict_proba call.
-
-    Scoring one row at a time costs ~10.9ms - almost all of it fixed overhead (building
-    a one-row DataFrame, then a 200-tree traversal that can't amortise anything). The
-    same work batched is ~0.03ms/row, ~360x cheaper, and the agent scores every candidate
-    match of every component, so this is the difference between seconds and minutes.
-    """
+    """Score many candidates in one predict_proba call: ~10.9ms/row one at a time (mostly
+    fixed overhead) vs ~0.03ms/row batched, over every candidate match of every component."""
     if not candidate_signals:
         return []
     rows = pd.DataFrame(

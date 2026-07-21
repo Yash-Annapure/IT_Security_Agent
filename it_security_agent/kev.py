@@ -32,13 +32,8 @@ def is_kev(cve_id: str, conn=None):
 
 
 def load_kev_ids(conn=None) -> set:
-    """Every known-exploited CVE id, as one set.
-
-    Callers that only need "is this in KEV?" should use this instead of is_kev() per
-    finding: is_kev costs 0.83ms a call, almost all of it json.loads-ing a record whose
-    body is then thrown away (the agent only reads it as a boolean). The whole catalog
-    is ~1,600 ids, so holding it in memory is cheaper than a single lookup was.
-    """
+    """Every known-exploited CVE id as one set (~1,600). Cheaper than is_kev() per finding,
+    which costs 0.83ms mostly json.loads-ing a record the caller only reads as a boolean."""
     conn = conn or nvd_cache.get_connection()
     _table(conn)
     return {row[0] for row in conn.execute("SELECT cve_id FROM kev")}

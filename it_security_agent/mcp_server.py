@@ -138,24 +138,6 @@ def _ensure_synced(conn):
     _last_synced = time.time()
 
 
-def _index_progress_printer(every_seconds=3.0):
-    """Throttled progress callback for the one-time product-index backfill.
-
-    On a full catalog this is tens of seconds during which the cache holds its write
-    lock; without output the server looks hung at startup.
-    """
-    state = {"last": 0.0}
-
-    def report(done, total):
-        now = time.time()
-        if now - state["last"] < every_seconds and done < total:
-            return
-        state["last"] = now
-        print(f"[index] building CPE product index: {done:,}/{total:,} CVEs", flush=True)
-
-    return report
-
-
 def _start_background_sync():
     """Kick off the NVD/KEV sync in a daemon thread at server startup.
 
@@ -170,13 +152,9 @@ def _start_background_sync():
 
     def work():
         try:
-            # Opening the cache runs the one-time CPE product-index backfill if it's
-            # outstanding. Doing it here, on the startup thread, means a cold server
-            # absorbs it before the first request rather than inside one - the same
-            # reasoning as the sync itself. It reports progress because on a full
-            # catalog it is tens of seconds of otherwise silent work.
-            conn = nvd_cache.get_connection(index_progress=_index_progress_printer())
-            _ensure_synced(conn)
+            # Opening the cache also runs the one-time product-index backfill if it's
+            # outstanding, so a cold server absorbs it here rather than inside a request.
+            _ensure_synced(nvd_cache.get_connection())
             print("[sync] NVD/KEV background sync complete.", flush=True)
         except Exception as exc:
             # A failed startup sync isn't fatal - the request path will retry lazily.
@@ -320,90 +298,56 @@ def raw_matches(components, conn):
 
 
 def _coverage_caveat(meta: dict, found_anything: bool) -> list:
-    """State how much of NVD was actually searched, and what that does to the result.
-
-    Matching can only find CVEs that are cached, so an incomplete sync produces a
-    reassuringly empty report rather than an error - the most dangerous way for this
-    tool to be wrong. Every report therefore carries its own coverage, and an empty
-    result on a thin cache is explicitly denied the reading "your code is clean".
-    """
+    """State how much of NVD was searched. Matching only finds cached CVEs, so a thin
+    cache yields a reassuringly empty report - never let that read as "clean"."""
     cache = meta.get("cache")
     if not cache:
         return []
-    lines = ["", f"_Searched a local NVD cache of {cache['cves']:,} CVEs "
-                 f"(~{cache['fraction']:.0%} of NVD's ~{NVD_CATALOG_SIZE:,}) "
-                 f"and {cache['kev']:,} CISA known-exploited entries._"]
+    lines = ["", f"_Searched {cache['cves']:,} cached CVEs (~{cache['fraction']:.0%} of NVD's "
+                 f"~{NVD_CATALOG_SIZE:,}) and {cache['kev']:,} CISA known-exploited entries._"]
     if not cache["thin"]:
         return lines
     if found_anything:
-        lines += ["", "> **Coverage caveat:** the local cache is incomplete, so this list "
-                      "is a lower bound - there may be further vulnerabilities whose CVEs "
-                      "simply aren't cached yet."]
-    else:
-        lines += [
-            "",
-            "> **This is not a clean bill of health.** Matching can only find CVEs that "
-            f"are in the local cache, and this cache holds ~{cache['fraction']:.0%} of "
-            "NVD's catalog. A component can only be reported as vulnerable if its CVE "
-            "was synced, so this result reflects cache coverage as much as code health. "
-            "Run `uv run warm_cache.py --full` to completion before treating an empty "
-            "result as meaningful.",
-        ]
-    return lines
+        return lines + ["", "> **Coverage caveat:** the cache is incomplete, so this list is a "
+                            "lower bound - other vulnerabilities may simply not be cached yet."]
+    return lines + ["", "> **This is not a clean bill of health.** Only cached CVEs can be "
+                        f"matched, and this cache holds ~{cache['fraction']:.0%} of NVD. Finish "
+                        "`uv run warm_cache.py --full` before treating an empty result as real."]
 
 
 def _verdict(result, meta: dict) -> list:
-    """The headline answer - were vulnerabilities found, yes or no - stated first.
-
-    A reader should never have to count section headings to find that out, and should
-    never read "none found" without also seeing how much of NVD was actually searched.
-    """
+    """The headline answer - vulnerabilities or not - stated before any section."""
     actionable = len(result.escalated) + len(result.confirmed)
-    needs_review = len(result.review_queue)
+    review = len(result.review_queue)
 
     if actionable:
-        headline = (f"**VULNERABILITIES FOUND: {actionable}** "
-                    f"({len(result.escalated)} actively exploited, {len(result.confirmed)} confirmed)"
-                    + (f", plus {needs_review} needing human review." if needs_review else "."))
-    elif needs_review:
-        headline = (f"**NO CONFIRMED VULNERABILITIES**, but {needs_review} candidate "
-                    f"match{'es' if needs_review > 1 else ''} need human review.")
+        headline = (f"**VULNERABILITIES FOUND: {actionable}** ({len(result.escalated)} actively "
+                    f"exploited, {len(result.confirmed)} confirmed)"
+                    + (f", plus {review} needing human review." if review else "."))
+    elif review:
+        headline = (f"**NO CONFIRMED VULNERABILITIES**, but {review} candidate "
+                    f"match{'es' if review > 1 else ''} need human review.")
     else:
         headline = "**NO VULNERABILITIES FOUND** in the scanned components."
-
     return ["", headline] + _coverage_caveat(meta, bool(actionable))
 
 
 def _flagging_policy(meta: dict) -> list:
-    """Explain how every match got into the bucket it's in.
-
-    The buckets are a policy decision, not a model output: the model only ever produces
-    a probability, and the risk weighting (a missed vulnerability costs 10x a false
-    alarm) is what turns that into a routing decision. Stating it in the report keeps
-    the reader from reading "confirmed" as certainty or "rejected" as absence.
-    """
+    """How each match got its bucket. The buckets are policy, not model output - saying
+    so stops "confirmed" reading as certainty or "rejected" as absence."""
     m = meta.get("model")
     lines = ["", "## How these were flagged", ""]
     if m:
-        lines.append(
-            f"A `{m['name']}` classifier was trained on this scan's own {m['training_rows']:,} "
-            f"candidate matches across {m['features']} features, scored with the risk weighting "
-            f"that counts a missed vulnerability as {model.FN_WEIGHT}x as costly as a false "
-            f"alarm, giving a decision threshold of **{m['threshold']:.2f}**.")
-        lines.append("")
+        lines += [f"A `{m['name']}` trained on this scan's own {m['training_rows']:,} candidate "
+                  f"matches across {m['features']} features, weighting a missed vulnerability "
+                  f"{model.FN_WEIGHT}x a false alarm - decision threshold **{m['threshold']:.2f}**.", ""]
     lines += [
-        "Every candidate match lands in exactly one bucket:",
-        "",
-        "- **escalated** - matched, and the CVE is on CISA's Known Exploited Vulnerabilities "
-        "list. Actively exploited in the wild; fix first.",
-        "- **confirmed** - the model's confidence cleared the threshold, *or* OSV.dev "
-        "independently reports a vulnerability for this exact package version.",
-        "- **review_queue** - matched, but confidence fell below the threshold and OSV "
-        "didn't corroborate. Kept for a human, with SHAP values showing which signals "
-        "pushed the score up or down. These are not dismissed - they are undecided.",
-        "- **rejected** - the package *name* matched a CVE but the pinned version isn't in "
-        "the affected range, or no plausible vendor matched. This is the name-collision "
-        "case (e.g. PyPI `babel` vs Babel.js).",
+        "- **escalated** - on CISA's Known Exploited Vulnerabilities list; exploited in the wild.",
+        "- **confirmed** - confidence cleared the threshold, *or* OSV.dev agrees for this version.",
+        "- **review_queue** - below threshold and uncorroborated. Undecided, not dismissed; "
+        "carries SHAP values showing which signals moved the score.",
+        "- **rejected** - name matched but the pinned version isn't affected, or no plausible "
+        "vendor. The name-collision case (PyPI `babel` vs Babel.js).",
     ]
     return lines
 
@@ -873,22 +817,28 @@ def _run_scan(lockfile_content: str, lockfile_type: str = "", max_components: in
         step(f"Capped to first {len(components)} of {total} components (max_components={max_components})")
 
     conn = get_connection()
-    if time.time() - _last_synced < SYNC_INTERVAL_SECONDS:
-        step("NVD CVE catalog + CISA KEV feed already synced (cached, <6h old)")
-    else:
-        step("Syncing NVD CVE catalog + CISA KEV feed (first sync takes 1-2 min)...")
-        _ensure_synced(conn)
-        step("NVD + KEV sync complete")
-
     coverage = _cache_coverage(conn)
     if coverage is not None:
         meta["cache"] = coverage
         step(f"Local NVD cache holds {coverage['cves']:,} CVEs "
              f"(~{coverage['fraction']:.0%} of NVD's ~{NVD_CATALOG_SIZE:,}) "
              f"+ {coverage['kev']:,} known-exploited")
-        if coverage["thin"]:
-            step("WARNING: cache coverage is incomplete - matching can only find CVEs that "
-                 "are cached, so a clean result here is not proof the code is clean")
+
+    # A warmed cache needs nothing from the network. The sync exists to fill a thin
+    # cache, not to re-check a complete one on every restart.
+    if coverage is not None and not coverage["thin"]:
+        step("Cache is complete - scanning offline, no NVD sync needed")
+    elif time.time() - _last_synced < SYNC_INTERVAL_SECONDS:
+        step("NVD CVE catalog + CISA KEV feed already synced (cached, <6h old)")
+    else:
+        step("Cache is incomplete - topping up with CVEs modified in the last 14 days "
+             "(incremental; the cached catalog is kept, not refetched)...")
+        _ensure_synced(conn)
+        coverage = _cache_coverage(conn) or coverage
+        if coverage is not None:
+            meta["cache"] = coverage
+        step("WARNING: cache coverage is incomplete - matching can only find CVEs that "
+             "are cached, so a clean result here is not proof the code is clean")
 
     prewarm(components, conn, step=step)
 
