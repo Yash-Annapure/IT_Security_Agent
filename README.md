@@ -62,8 +62,16 @@ API key, once - after which every name is a cache hit.
 ```
 uv run warm_cache.py path/to/uv.lock path/to/package-lock.json   # specific files
 uv run warm_cache.py --days 90     # widen the CVE window (default 14 days)
-uv run warm_cache.py --full        # pull NVD's entire CVE catalog (slow, rarely needed)
+uv run warm_cache.py --full        # pull NVD's entire CVE catalog - see below first
 ```
+
+**On `--full`:** it fetches all ~370,000 CVEs in NVD, which is ~185 sequential
+requests: 10-20 minutes with an API key, 30-45 without. You almost never want
+it - matching only consults recently-changed CVEs, which the default window
+already covers, and `--days 90` covers more still. If you do run it, pages are
+written to SQLite as they arrive (never held in memory) and progress prints
+every couple of seconds, so you can watch it work rather than guess whether
+it hung.
 
 Re-run it occasionally to pick up newly published CVEs. It's incremental -
 already-cached names are skipped, so a re-run only fetches what's new.

@@ -99,7 +99,7 @@ def main():
 
     started = time.time()
     conn = nvd_cache.get_connection()
-    print(f"Cache database: {nvd_cache.DB_PATH}\n")
+    print(f"Cache database: {nvd_cache.DB_PATH}\n", flush=True)
 
     print("Reading lockfiles:", flush=True)
     names = _collect_names(paths)
@@ -108,15 +108,33 @@ def main():
         sys.exit(1)
     print(f"  -> {len(names)} unique package names", flush=True)
 
+    last_report = [0.0]
+
+    def sync_progress(fetched, total):
+        # NVD pages 2000 at a time, so a full sync is ~185 requests over tens of
+        # minutes. Without this the command looks hung.
+        now = time.time()
+        if now - last_report[0] < 2 and fetched < total:
+            return
+        last_report[0] = now
+        pct = (fetched / total * 100) if total else 0
+        print(f"    {fetched:,}/{total:,} CVEs ({pct:.0f}%)", flush=True)
+
     if full:
-        print("\nSyncing NVD's ENTIRE CVE catalog (this takes a long time and is rarely "
-              "needed - the incremental window covers active CVEs)...", flush=True)
-        count = nvd_cache.sync_full(conn=conn)
+        print("\nSyncing NVD's ENTIRE CVE catalog...", flush=True)
+        print("  NOTE: this is ~370,000 CVEs over ~185 sequential requests - expect "
+              f"{'10-20' if NVD_API_KEY else '30-45'} minutes"
+              f"{'' if NVD_API_KEY else ' (no NVD_API_KEY - set one to cut this ~6x)'}.",
+              flush=True)
+        print("  You almost never need this: the default incremental window covers "
+              "recently-changed CVEs, which is what matching actually uses. Ctrl-C now "
+              "and re-run without --full if you'd rather not wait.\n", flush=True)
+        count = nvd_cache.sync_full(conn=conn, on_progress=sync_progress)
     else:
         print(f"\nSyncing NVD CVEs modified in the last {days} days...", flush=True)
         since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
-        count = nvd_cache.sync_incremental(since=since, conn=conn)
-    print(f"  -> stored/updated {count} CVEs", flush=True)
+        count = nvd_cache.sync_incremental(since=since, conn=conn, on_progress=sync_progress)
+    print(f"  -> stored/updated {count:,} CVEs", flush=True)
 
     print("\nRefreshing CISA KEV (known exploited vulnerabilities) feed...", flush=True)
     kev.refresh(conn=conn)

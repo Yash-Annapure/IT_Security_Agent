@@ -32,22 +32,43 @@ def _store_vulns(conn, vulns):
     conn.commit()
 
 
-def sync_full(conn=None, fetch_fn=nvd_client.fetch_all_pages):
-    conn = conn or get_connection()
-    vulns, _ = fetch_fn({})
-    _store_vulns(conn, vulns)
-    return len(vulns)
+def _sync(params, conn, fetch_fn, on_progress=None):
+    """Fetch `params` from NVD and store the results, returning how many were stored.
+
+    Pages are written to SQLite as they arrive rather than accumulated, so even a full
+    catalog sync (~370k CVEs) stays flat in memory. `on_progress(fetched, total)` is
+    forwarded per page so callers can show movement during what is otherwise a long
+    silent wait.
+    """
+    stored = 0
+
+    def on_page(vulns, fetched, total):
+        nonlocal stored
+        _store_vulns(conn, vulns)
+        stored += len(vulns)
+        if on_progress is not None:
+            on_progress(fetched, total)
+
+    vulns, _ = fetch_fn(params, on_page=on_page)
+    if vulns:
+        # A fetch_fn that ignored on_page (an older client, or a test double) returns
+        # everything at once instead - store that rather than silently dropping it.
+        _store_vulns(conn, vulns)
+        stored += len(vulns)
+    return stored
 
 
-def sync_incremental(since: datetime.datetime, conn=None, fetch_fn=nvd_client.fetch_all_pages):
-    conn = conn or get_connection()
+def sync_full(conn=None, fetch_fn=nvd_client.fetch_all_pages, on_progress=None):
+    return _sync({}, conn or get_connection(), fetch_fn, on_progress)
+
+
+def sync_incremental(since: datetime.datetime, conn=None, fetch_fn=nvd_client.fetch_all_pages,
+                     on_progress=None):
     params = {
         "lastModStartDate": since.strftime("%Y-%m-%dT%H:%M:%S.000"),
-        "lastModEndDate": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000"),
+        "lastModEndDate": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000"),
     }
-    vulns, _ = fetch_fn(params)
-    _store_vulns(conn, vulns)
-    return len(vulns)
+    return _sync(params, conn or get_connection(), fetch_fn, on_progress)
 
 
 def query_by_product_name(name: str, conn=None):

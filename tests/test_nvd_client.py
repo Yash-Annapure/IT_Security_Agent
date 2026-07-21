@@ -32,3 +32,18 @@ def test_fetch_all_pages_paginates_until_total_reached():
     assert vulns == [1, 2, 3]
     assert total == 3
     assert get_fn.call_count == 2
+
+
+def test_fetch_all_pages_streams_to_on_page_without_accumulating():
+    # Streaming mode exists so a full-catalog sync (~370k CVEs) never has to hold the
+    # whole result set in memory before any of it is written.
+    page1 = _response(200, {"totalResults": 3, "vulnerabilities": [1, 2]})
+    page2 = _response(200, {"totalResults": 3, "vulnerabilities": [3]})
+    get_fn = MagicMock(side_effect=[page1, page2])
+    seen = []
+    vulns, total = nvd_client.fetch_all_pages(
+        {}, page_size=2, get_fn=get_fn, sleep_fn=MagicMock(), on_page=lambda v, f, t: seen.append((v, f, t))
+    )
+    assert vulns == []  # nothing accumulated - the callback owns the data
+    assert total == 3
+    assert seen == [([1, 2], 2, 3), ([3], 3, 3)]  # per-page data plus running progress
