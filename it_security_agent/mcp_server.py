@@ -53,6 +53,30 @@ CLINERULES_PATH = Path(__file__).resolve().parent.parent / ".clinerules" / "scan
 MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8765"))
 
+# Tools taking raw file content are hidden from the tool list by default.
+#
+# This is the fix for the failure mode that kept overflowing small models: asked to
+# "scan for vulnerabilities", a model picks the most on-the-nose tool it can see. With
+# scan_repo(lockfile_content=...) advertised, that tool's own schema tells it a lockfile
+# must be read into context first - which is precisely what blows a 32K window on a
+# 300KB package-lock.json. Prose in `instructions` cannot outrank a required parameter
+# named `lockfile_content`; removing the parameter from view can.
+#
+# What remains is a tool list where every entry is safe: the command tools return a
+# command, and the file itself travels disk -> curl -> /scan without passing through the
+# model at all. Set EXPOSE_CONTENT_TOOLS=1 to advertise them again (useful with a
+# large-context model, or to demo the direct-call path).
+EXPOSE_CONTENT_TOOLS = os.environ.get("EXPOSE_CONTENT_TOOLS", "").lower() in ("1", "true", "yes")
+
+
+def content_tool(fn):
+    """Register `fn` as an MCP tool only when content-taking tools are opted in.
+
+    Always returns the plain function, so the HTTP routes, the notebook and the tests
+    keep calling it exactly as before - only its visibility in the tool list changes.
+    """
+    return mcp.tool()(fn) if EXPOSE_CONTENT_TOOLS else fn
+
 # `instructions` is server-wide guidance some MCP clients (Cline included) surface
 # alongside the tool list, independent of any single tool's own docstring - the one
 # place that's guaranteed visible in a brand-new repo that has no .clinerules/ yet,
@@ -684,7 +708,7 @@ async def condense_http_endpoint(request):
         return PlainTextResponse(str(exc), status_code=400)
 
 
-@mcp.tool()
+@content_tool
 def condense_lockfile(
     lockfile_content: Annotated[str, Field(description=(
         "The literal text of a uv.lock, package-lock.json, or requirements.txt file - "
@@ -740,7 +764,7 @@ def condense_lockfile(
     return _condense(lockfile_content, lockfile_type)
 
 
-@mcp.tool()
+@content_tool
 def scan_repo(
     lockfile_content: Annotated[str, Field(description=(
         "The literal text of a uv.lock, package-lock.json, or requirements.txt file - "
