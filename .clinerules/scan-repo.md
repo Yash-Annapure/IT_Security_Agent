@@ -136,13 +136,15 @@ re-describing the plan on every reply.
 
        curl -s -X POST <server-base-url>/condense --data-binary @uv.lock
 
-   - `<server-base-url>` is the `it-security-agent` MCP server's URL from
-     this Cline setup's MCP settings, with the trailing `/mcp` removed
-     (e.g. if the MCP URL is `https://example.trycloudflare.com/mcp`, use
-     `https://example.trycloudflare.com/condense`). If you don't know the
-     URL, ask the user for it once - do not guess.
+   - To get `<server-base-url>`: call the `get_condense_command` **MCP
+     tool** first - it returns this exact command with the server's current
+     URL already filled in, derived live from your own connection to it.
+     The URL can change on every server reboot (quick tunnels mint a new
+     hostname each time), so **never guess it and never reuse a URL
+     remembered from an earlier conversation** - always ask the tool.
    - On Windows PowerShell, write `curl.exe`, not `curl` (plain `curl` is
-     an alias for a different command there).
+     an alias for a different command there), and quote the `@` argument:
+     `--data-binary '@uv.lock'`.
    - Substitute the real lockfile path from step 1 after the `@`.
 
    The command prints a short `name==version` list (a few KB). If it prints

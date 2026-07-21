@@ -74,17 +74,17 @@ Paste into Cline -> "Configure MCP Servers" (merge into an existing
       "type": "streamableHttp",
       "url": "http://192.168.1.42:8765/mcp",
       "timeout": 300,
-      "autoApprove": ["condense_lockfile", "scan_repo"]
+      "autoApprove": ["get_condense_command", "condense_lockfile", "scan_repo"]
     }
   }
 }
 ```
 
 Copy that URL and JSON block directly - nothing to fill in by hand.
-`autoApprove` skips Cline's per-call confirmation prompt for
-`condense_lockfile` and `scan_repo` (safe to leave in - neither writes to or
-executes anything on the caller's machine; drop either name from the list
-if you'd rather approve those calls by hand).
+`autoApprove` skips Cline's per-call confirmation prompt for those tools
+(safe to leave in - none of them writes to or executes anything on the
+caller's machine; drop any name from the list if you'd rather approve those
+calls by hand).
 It auto-detects the box's LAN-reachable IP; if that's wrong for your network
 (behind NAT, inside a container, etc.), set `MCP_PUBLIC_HOST` to the correct
 address/hostname and restart. `MCP_PORT` overrides the port (default 8765).
@@ -177,6 +177,17 @@ context only ever contains the command itself and the few-KB condensed
 result (just `name==version` pairs, extracted with the exact same parser
 `scan_repo` uses, so the scan result is identical - wheel/sdist URLs and
 hashes were never part of what gets matched against NVD/KEV/OSV anyway).
+
+The model never needs to be told the server's URL, either - a quick
+cloudflared tunnel mints a new random hostname on every boot, so hardcoding
+it anywhere would rot immediately. Instead, the `get_condense_command` MCP
+tool returns the curl command with the current public URL already filled in,
+derived from the caller's own connection: every MCP request arrives
+*through* the tunnel, carrying the live hostname in its `Host` header (and
+the original scheme in `X-Forwarded-Proto`), so the server reads its own
+address off the request being handled. `.clinerules/` tells the model to
+always ask that tool for the command rather than guessing or reusing a URL
+from an earlier session.
 On this repo's own `uv.lock` that's a ~99.5% cut: 618KB -> 3KB, 158
 packages. The model then passes that printed result to the `scan_repo` MCP
 tool. `.clinerules/` forbids reading the raw lockfile outright - locating it

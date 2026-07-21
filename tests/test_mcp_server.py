@@ -130,6 +130,34 @@ def test_condense_lockfile_rejects_unexpanded_shell_substitution_with_clear_erro
         mcp_server.condense_lockfile(lockfile_content="$(cat uv.lock)")
 
 
+def _fake_ctx(headers):
+    from types import SimpleNamespace
+    request = None if headers is None else SimpleNamespace(headers=headers)
+    return SimpleNamespace(request_context=SimpleNamespace(request=request))
+
+
+def test_get_condense_command_derives_https_url_from_forwarded_headers():
+    # The tunnel (cloudflared) terminates TLS and forwards plain HTTP, so the original
+    # scheme arrives in x-forwarded-proto and the public hostname in host.
+    ctx = _fake_ctx({"host": "example.trycloudflare.com", "x-forwarded-proto": "https"})
+    text = mcp_server.get_condense_command(ctx)
+    assert "https://example.trycloudflare.com/condense" in text
+    assert "--data-binary" in text
+    assert "curl.exe" in text  # PowerShell variant included
+
+
+def test_get_condense_command_falls_back_to_http_without_proto_header():
+    ctx = _fake_ctx({"host": "192.168.1.42:8765"})
+    text = mcp_server.get_condense_command(ctx)
+    assert "http://192.168.1.42:8765/condense" in text
+
+
+def test_get_condense_command_asks_the_user_when_no_request_is_available():
+    text = mcp_server.get_condense_command(_fake_ctx(None))
+    assert "Ask the user" in text
+    assert "/condense" in text  # still explains the command shape
+
+
 def _http_client():
     # The /condense custom route is registered on the same ASGI app the real server
     # runs (streamable-http transport), so testing through that app exercises the
@@ -351,7 +379,8 @@ def test_startup_banner_includes_auto_approve_for_scan_repo():
     expected_config = json.dumps(
         {"mcpServers": {"it-security-agent": {
             "type": "streamableHttp", "url": "http://10.0.0.5:8765/mcp",
-            "timeout": 300, "autoApprove": ["condense_lockfile", "scan_repo"],
+            "timeout": 300,
+            "autoApprove": ["get_condense_command", "condense_lockfile", "scan_repo"],
         }}},
         indent=2,
     )

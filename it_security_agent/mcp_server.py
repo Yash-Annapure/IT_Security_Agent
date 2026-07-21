@@ -31,7 +31,7 @@ from typing import Annotated
 
 import requests
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
 from it_security_agent import agent, cpe_dictionary, explain, kev, labeling, matching, model, nvd_cache, repo_scan, sbom
@@ -70,12 +70,12 @@ mcp = FastMCP(
         "requirements.txt) with your file tool or print it with type/cat - raw "
         "lockfiles are often large enough to overflow your entire context window in "
         "one message. Instead, condense it in your terminal so only the small result "
-        "enters the conversation: curl -s -X POST <this-server-base-url>/condense "
-        "--data-binary @uv.lock (base URL = this server's MCP URL minus the /mcp "
-        "path; use curl.exe on Windows PowerShell). Then call the scan_repo MCP tool "
-        "with lockfile_content set to exactly what that printed. scan_repo and "
-        "get_setup_rules are MCP tools only, never terminal commands; the condense "
-        "curl is the one terminal step in the workflow."
+        "enters the conversation: call the get_condense_command tool to get the exact "
+        "curl command with this server's current URL filled in (never guess the URL - "
+        "it can change on every server reboot), run that command, then call the "
+        "scan_repo MCP tool with lockfile_content set to exactly what it printed. "
+        "scan_repo and get_setup_rules are MCP tools only, never terminal commands; "
+        "the condense curl is the one terminal step in the workflow."
     ),
 )
 
@@ -297,6 +297,58 @@ def get_setup_rules() -> str:
             "retrying or by the caller."
         )
     return CLINERULES_PATH.read_text(encoding="utf-8")
+
+
+def _derive_public_base(headers) -> str | None:
+    """Derive this server's publicly reachable base URL from an incoming request.
+
+    The server can't know its own tunnel URL from config - quick cloudflared tunnels
+    mint a new random hostname on every boot. But every MCP request *arrives through*
+    that tunnel, carrying the public hostname in its Host header (and the original
+    scheme in X-Forwarded-Proto, since the tunnel terminates TLS and forwards plain
+    HTTP). So the freshest answer to "what URL am I reachable at?" is sitting on
+    whatever request is being handled right now.
+    """
+    host = headers.get("x-forwarded-host") or headers.get("host")
+    if not host:
+        return None
+    scheme = headers.get("x-forwarded-proto") or "http"
+    return f"{scheme}://{host}"
+
+
+@mcp.tool()
+def get_condense_command(ctx: Context) -> str:
+    """Return the exact terminal command for condensing a lockfile, with this server's
+    CURRENT public URL already filled in.
+
+    Call this whenever you need to condense a lockfile and don't know (or aren't sure
+    of) the server's base URL. The URL is derived live from your own connection to this
+    server - the very request you just made carries the hostname you reached it
+    through - so the answer is always current, even though a tunnel URL can change on
+    every server reboot. Never guess the URL and never reuse one remembered from an
+    earlier conversation; call this instead.
+    """
+    try:
+        request = ctx.request_context.request
+        headers = request.headers if request is not None else None
+    except Exception:
+        headers = None
+    base = _derive_public_base(headers) if headers is not None else None
+    if base is None:
+        return (
+            "Could not determine this server's public URL from the current connection "
+            "(no Host header available). Ask the user for the it-security-agent server's "
+            "base URL - it's the MCP URL in their Cline settings with the trailing /mcp "
+            "removed - then run: curl -s -X POST <base-url>/condense --data-binary @uv.lock"
+        )
+    return (
+        "Run exactly one of these in the terminal, substituting the real lockfile "
+        "filename after the @ if it isn't uv.lock:\n\n"
+        f"  bash / cmd:         curl -s -X POST {base}/condense --data-binary @uv.lock\n"
+        f"  Windows PowerShell: curl.exe -s -X POST {base}/condense --data-binary '@uv.lock'\n\n"
+        "It prints the condensed name==version list - pass exactly that printed text to "
+        "scan_repo's lockfile_content. Do not read the raw lockfile yourself."
+    )
 
 
 def _condense(lockfile_content: str, lockfile_type: str = "") -> str:
@@ -536,7 +588,7 @@ def startup_banner(host: str, port: int) -> str:
         cline_config = json.dumps(
             {"mcpServers": {"it-security-agent": {
                 "type": "streamableHttp", "url": url, "timeout": 300,
-                "autoApprove": ["condense_lockfile", "scan_repo"],
+                "autoApprove": ["get_condense_command", "condense_lockfile", "scan_repo"],
             }}},
             indent=2,
         )
@@ -548,16 +600,17 @@ def startup_banner(host: str, port: int) -> str:
             "",
             cline_config,
             "",
-            "\"autoApprove\": [\"condense_lockfile\", \"scan_repo\"] skips Cline's per-call",
-            "confirmation prompt for both tools - safe to leave in, since neither writes to",
-            "or executes anything on the caller's machine. Remove either name from the list",
-            "if you'd rather approve those calls by hand.",
+            "\"autoApprove\" skips Cline's per-call confirmation prompt for those tools -",
+            "safe to leave in, since none of them writes to or executes anything on the",
+            "caller's machine. Remove any name from the list if you'd rather approve",
+            "those calls by hand.",
             "",
             "Raw-lockfile ingress (keeps big lockfiles out of the model's context):",
             f"  curl -s -X POST http://{public_host}:{port}/condense --data-binary @uv.lock",
-            "If you reach this server through a tunnel (e.g. cloudflared), use the tunnel",
-            "hostname instead of the address above - same base URL as your Cline MCP",
-            "config, with /mcp replaced by /condense.",
+            "Behind a tunnel (e.g. cloudflared) the hostname above is wrong - but nobody",
+            "needs to track it: the get_condense_command tool returns this command with",
+            "the live public URL filled in, derived from the caller's own connection, so",
+            "it stays correct even when a quick tunnel mints a new URL every boot.",
             "",
             "No built-in auth - only expose this on a private/trusted network.",
         ]
