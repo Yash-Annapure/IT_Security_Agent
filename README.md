@@ -152,41 +152,43 @@ generates one from it (a real CycloneDX document, not a description of one)
 and returns it inline alongside the findings - `.clinerules/` tells the model
 this counts as the answer, not a "can't do that" response.
 
-### Keeping lockfiles small enough to fit in context
+### Keeping lockfiles out of the model's context entirely
 
-`condense_lockfile` is an MCP tool (same server, alongside `scan_repo`) that
-strips a lockfile down to just `name==version` pairs (or the npm
-equivalent), using the exact same parser `scan_repo` uses server-side - the
-scan result is identical either way, since wheel/sdist URLs and hashes were
-never part of what gets matched against NVD/KEV/OSV anyway. On this repo's
-own `uv.lock` that's a ~99.5% size cut (618KB -> 3KB, 158 packages).
-`.clinerules/` tells the model to always call it before `scan_repo`, instead
-of reading the raw lockfile directly into the conversation.
+The load-bearing rule of this whole workflow: **the raw lockfile's bytes
+must never pass through the model's context window.** A real `uv.lock` is
+often hundreds of KB (this repo's own is 618KB / ~131K tokens - 4x a
+32K-context model's entire window), and it doesn't matter *how* it gets into
+the conversation - a file-read tool, `type`/`cat` output, or an MCP tool
+argument all end up in context just the same. Two earlier designs learned
+this the hard way: a terminal-script flow where the model `type`d the raw
+file (crashed the GPU with an out-of-memory error), and an MCP-tool-only
+flow where the model dutifully *read* the file to pass it as a tool argument
+(instantly overflowed its context - the read itself was the failure).
 
-It's deliberately an MCP tool rather than a terminal script: an earlier
-version of this workflow used a `condense_lockfile.py` script the model had
-to invoke via its terminal tool, and in practice the model sometimes
-generalized that pattern to `scan_repo` too - trying to run it as a script,
-a Python module, or a CLI command that doesn't exist, none of which work,
-since `scan_repo` only exists as an MCP tool. Making both tools live on the
-same MCP server removes the terminal step (and that confusion) entirely -
-the only local-filesystem operation in the whole workflow is reading the
-lockfile itself, since this server has no access to the caller's machine.
-`condense_lockfile.py` (repo root) still exists as a thin CLI wrapper around
-the same tool, for use outside Cline (scripting, or just checking what
-`scan_repo` would receive) - but Cline is told to always use the MCP tool,
-never this script.
+The fix is architectural: the MCP server exposes a plain HTTP ingress,
+`POST /condense`, and the model's only job is one terminal command:
 
-This matters more than it sounds: a raw lockfile is often large enough to
-overflow a small local model's entire context window in one message - this
-project hit that directly (a 176,548-character raw `uv.lock` pushed one
-request to ~135,000 tokens against Qwen2.5-7B-Instruct's real 32768-token
-context, and crashed the GPU with a CUDA out-of-memory error trying to
-allocate KV-cache space for it). `serve_mistral.py` now also rejects any
-prompt over `MAX_INPUT_TOKENS` (default 28000, override via env var) with a
-clear HTTP 413 before calling `model.generate()`, so an oversized prompt
-fails cleanly instead of crashing the server - but condensing first is what
-actually avoids hitting that limit on a real dependency tree.
+```
+curl -s -X POST http://<server>:8765/condense --data-binary @uv.lock
+```
+
+`curl` streams the file from disk straight to the server - the model's
+context only ever contains the command itself and the few-KB condensed
+result (just `name==version` pairs, extracted with the exact same parser
+`scan_repo` uses, so the scan result is identical - wheel/sdist URLs and
+hashes were never part of what gets matched against NVD/KEV/OSV anyway).
+On this repo's own `uv.lock` that's a ~99.5% cut: 618KB -> 3KB, 158
+packages. The model then passes that printed result to the `scan_repo` MCP
+tool. `.clinerules/` forbids reading the raw lockfile outright - locating it
+is fine, opening it is not.
+
+Two backstops remain for when something slips through anyway: a
+`condense_lockfile` MCP tool still exists for small content already
+legitimately in-context, and `serve_mistral.py` rejects any prompt over
+`MAX_INPUT_TOKENS` (default 28000, override via env var) with a clear HTTP
+413 before calling `model.generate()`, so an oversized prompt fails cleanly
+instead of crashing the server. `condense_lockfile.py` (repo root) is a thin
+CLI wrapper over the same logic for use outside Cline.
 
 ### Using it against a different repo for the first time
 

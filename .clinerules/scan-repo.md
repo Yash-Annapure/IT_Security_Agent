@@ -8,21 +8,31 @@ follow these steps literally, in order, every time.
 
 ## Hard rules - read this list first, every time
 
-- `condense_lockfile`, `scan_repo`, `get_setup_rules` are **MCP tools
-  only**. Never a terminal command, script, Python module, or CLI - not
-  even ones that exist as files in this repo (see below for why).
+- **NEVER read, open, or print the raw lockfile** (`uv.lock`,
+  `package-lock.json`, `requirements.txt`) - not with your file-read tool,
+  not with `type`/`cat`, not partially, not "just the first N lines." Its
+  raw content must never appear in this conversation: a real lockfile is
+  often hundreds of KB and will overflow your entire context window in a
+  single message. Reading it is what has actually broken this workflow in
+  practice - locating it is fine, reading it is not.
+- **Condense in the terminal, scan via MCP**: the one terminal command in
+  this workflow is the condense step (`curl` to the server's `/condense`
+  endpoint - exact command below), which prints a few-KB result. Then call
+  the `scan_repo` **MCP tool** with exactly that printed output. Never pass
+  a raw lockfile into `scan_repo`.
+- `scan_repo` and `get_setup_rules` are **MCP tools only**. Never a
+  terminal command, script, Python module, or CLI - not even ones that
+  exist as files in this repo (see below for why).
 - **Never write to, edit, or overwrite any file that already exists** in
   this repo - not the lockfile, not `.clinerules/`, not anything. The only
   files you ever write are new ones: a report under `reports/`, or an
   explicitly-requested SBOM file.
 - **Never run `pip install`, `uv sync`, `uv add`,** or any install/setup
   command to "fix" a tool-not-found error. Nothing needs installing, ever -
-  both tools are already available to you right now.
+  the tools are already available to you right now.
 - **Never pass a file path, shell command, or `$(...)`/backtick
-  substitution** as `lockfile_content` - only literal text you already read.
-- **Always condense before scanning**: read the lockfile -> call
-  `condense_lockfile` -> call `scan_repo` with what that returned. Never
-  pass the raw lockfile straight into `scan_repo`.
+  substitution** as `lockfile_content` - only the literal condensed text
+  the condense command printed.
 - **If a tool call fails, read the error and fix what it says.** Never
   retry the identical call unchanged, and never "work around" a failure by
   editing a file instead of fixing the call.
@@ -32,17 +42,17 @@ thing forward, carry this list.
 
 ## Never edit, write to, or overwrite the lockfile - or any existing file
 
-This entire workflow is read-only with respect to every file that already
-exists in this repo. You **read** the lockfile (`uv.lock`,
-`package-lock.json`, `requirements.txt`) - you never edit it, rewrite it,
-"condense it in place," truncate it, or touch it with any write/edit tool,
-for any reason, under any circumstance. Condensing a lockfile does not mean
-shrinking the file on disk - it means calling the `condense_lockfile` MCP
-tool with the text you read, entirely in memory; the tool returns a smaller
-string, and the original file on disk is never involved in that at all. If
-any step in this workflow fails, the fix is always to call the right MCP
-tool correctly, never to edit, fix, "clean up," or work around it by
-modifying a source file yourself.
+This entire workflow never modifies any file that already exists in this
+repo. You **locate** the lockfile (`uv.lock`, `package-lock.json`,
+`requirements.txt`) and hand its *path* to a terminal command - you never
+edit it, rewrite it, "condense it in place," truncate it, or touch it with
+any write/edit tool, for any reason, under any circumstance. Condensing a
+lockfile does not mean shrinking the file on disk - the `/condense` curl
+command reads the file itself, sends the bytes to the server, and prints a
+smaller *result*; the original file on disk is never changed by anything in
+this workflow. If any step fails, the fix is always to run the right command
+or call the right MCP tool correctly, never to edit, fix, "clean up," or
+work around it by modifying a source file yourself.
 
 The only files this workflow ever **writes** are new ones: the report
 (`reports/<date>-scan.md` or `.html`, see below), and - only if the user
@@ -54,29 +64,30 @@ about to open a write/edit tool on `uv.lock`, `package-lock.json`,
 `get_setup_rules` bootstrap in a *different* repo), or any other file that
 isn't a new report or an explicitly-requested SBOM file - stop. That is not
 a step in this workflow; something has gone wrong, and the correct recovery
-is to go back to reading the lockfile and calling the MCP tools, not to
-write to anything.
+is to go back to the condense command and the MCP tools, not to write to
+anything.
 
-## `condense_lockfile` and `scan_repo` are MCP tools, not scripts - never run them from a terminal
+## What runs where: one terminal command, then MCP tools only
 
-`condense_lockfile`, `scan_repo`, and `get_setup_rules` exist *only* as
-tools on the `it-security-agent` MCP server - call them through your MCP
-tool-use mechanism, the same way you'd call any other MCP tool, never via
-`python scan_repo.py`, `python -m it_security_agent.scan_repo`,
-`uv run scan_repo.py`, `it-security-agent scan_repo`, or any other
-shell/terminal command. **There is nothing to run in a terminal anywhere in
-this workflow** - the only local-filesystem step is reading the lockfile
-itself with your own file tool; everything after that is a tool call.
+The condense step is the **only** terminal command in this workflow - a
+single `curl` to the server's `/condense` endpoint (exact command in the
+steps below). Everything else is an MCP tool call: `scan_repo` and
+`get_setup_rules` exist *only* as tools on the `it-security-agent` MCP
+server - call them through your MCP tool-use mechanism, the same way you'd
+call any other MCP tool, never via `python scan_repo.py`,
+`python -m it_security_agent.scan_repo`, `uv run scan_repo.py`,
+`it-security-agent scan_repo`, or any other shell/terminal command.
 
-This has been tried more than once in practice, so `scan_repo.py` (repo
-root) and `it_security_agent/scan_repo.py` do exist as files now - but only
-as deliberate redirect stubs that immediately print an error and exit if you
-run them. They are not the real tool and never will work as a script; seeing
-them in a file listing is not a sign you should try running one, it's the
-opposite signal. `condense_lockfile.py` (repo root) is a real, runnable
-script, but it's a convenience for use *outside* Cline (scripting, checking
-what `scan_repo` would receive) - inside Cline, always use the
-`condense_lockfile` MCP tool, not this script.
+Running scan_repo as a script has been tried more than once in practice, so
+`scan_repo.py` (repo root) and `it_security_agent/scan_repo.py` do exist as
+files now - but only as deliberate redirect stubs that immediately print an
+error and exit if you run them. They are not the real tool and never will
+work as a script; seeing them in a file listing is not a sign you should try
+running one, it's the opposite signal. A `condense_lockfile` MCP tool also
+exists, but it only makes sense for small content already legitimately
+in-context - for an actual lockfile on disk, always use the `/condense` curl
+command instead, because an MCP tool argument has to pass through your own
+context first, which defeats the entire point.
 
 If a command referencing `scan_repo` or `condense_lockfile` fails with "No
 such file or directory," "No module named," or similar, that is not a sign
@@ -100,10 +111,10 @@ that kind of question from memory or training data - always call the tool.
 
 ## Commit to action - do not re-plan
 
-If you can already state the two steps below, or you've already read the
-lockfile earlier in this conversation, do not describe the plan again and do
-not ask the user to confirm it - perform step 1 (if not already done) and
-then step 2, immediately, in the same turn. Restating this same plan more
+If you can already state the three steps below, or you've already run the
+condense command earlier in this conversation, do not describe the plan
+again and do not ask the user to confirm it - perform the next unfinished
+step, immediately, in the same turn. Restating this same plan more
 than once without making tool-call progress is a known failure mode small
 models hit on this exact task - break out of it by acting, not by
 re-explaining. If you are in Cline's Plan mode, you cannot call tools at all;
@@ -112,42 +123,53 @@ re-describing the plan on every reply.
 
 ## How to call it (do these three steps in order)
 
-1. Find the repo's actual lockfile at **the root of the project you were
-   asked to scan** (not your currently open editor tab, not a file mentioned
-   earlier in this conversation for some other reason) - in this order of
-   preference: `uv.lock` (or any other `*.lock`), `package-lock.json`,
-   `requirements.txt`. Read it with your own file tool. This is the *only*
-   local-filesystem step in the whole workflow.
-2. Call the `condense_lockfile` **MCP tool** with `lockfile_content` set to
-   the literal text you just read in step 1. Use exactly what it returns -
-   don't re-type, reformat, or summarize it.
+1. **Locate** the repo's actual lockfile at **the root of the project you
+   were asked to scan** (not your currently open editor tab, not a file
+   mentioned earlier in this conversation for some other reason) - in this
+   order of preference: `uv.lock` (or any other `*.lock`),
+   `package-lock.json`, `requirements.txt`. A directory listing is enough to
+   confirm it exists. **Do NOT read or open it** - you only need its path.
+2. **Condense it in the terminal** - this is the one terminal command in the
+   workflow, and it keeps the raw bytes out of this conversation entirely
+   (they go straight from disk to the server; only the small result comes
+   back):
+
+       curl -s -X POST <server-base-url>/condense --data-binary @uv.lock
+
+   - `<server-base-url>` is the `it-security-agent` MCP server's URL from
+     this Cline setup's MCP settings, with the trailing `/mcp` removed
+     (e.g. if the MCP URL is `https://example.trycloudflare.com/mcp`, use
+     `https://example.trycloudflare.com/condense`). If you don't know the
+     URL, ask the user for it once - do not guess.
+   - On Windows PowerShell, write `curl.exe`, not `curl` (plain `curl` is
+     an alias for a different command there).
+   - Substitute the real lockfile path from step 1 after the `@`.
+
+   The command prints a short `name==version` list (a few KB). If it prints
+   an error instead, read the error - it says what was wrong.
 3. Call the `scan_repo` **MCP tool** with `lockfile_content` set to exactly
-   what `condense_lockfile` returned in step 2.
+   what step 2 printed - don't re-type, reformat, or summarize it.
 
-Steps 2 and 3 are both MCP tool calls, through your MCP tool-use mechanism -
-never a terminal command, never `python`, never `uv run`. **Always condense
-first - never pass the raw lockfile's content to `scan_repo` directly, and
-never `type`/`cat` the raw lockfile into the conversation.** Raw lockfiles
-are mostly per-platform wheel/sdist download URLs and hashes that
-`scan_repo`'s own parser throws away anyway; on a real dependency tree that
-noise is large enough to overflow your entire context window in a single
-message - this project hit exactly that (one raw lockfile crashed the model
-server with an out-of-memory error). `condense_lockfile` strips that noise
-to just name/version pairs using the same parser `scan_repo` uses
-server-side, so the scan result is identical either way - condensing loses
-nothing that matters to vulnerability matching, only bytes it never needed.
+**Why never read the raw lockfile:** it's mostly per-platform wheel/sdist
+download URLs and hashes that the scanner throws away anyway, and on a real
+dependency tree that noise is large enough to overflow your entire context
+window in one message - this project hit exactly that, twice: once crashing
+the model server with an out-of-memory error, once burning a whole session's
+context on a single file read. The `/condense` endpoint strips it to just
+name/version pairs using the same parser `scan_repo` uses, so the scan
+result is identical - condensing loses nothing that matters to vulnerability
+matching, only bytes it never needed.
 
-Before calling either tool, sanity-check your own `lockfile_content` value:
-does it contain actual package names and version numbers (or, for step 3,
-exactly what `condense_lockfile` returned)? If it looks like a description,
-a filename, angle brackets, an ellipsis, or **literal shell syntax you
-expected to be expanded** (e.g. `$(cat uv.lock)`, backticks, `%VAR%`) - MCP
-tool arguments are never run through a shell, nothing expands that for you -
-you have not actually read the file (or called `condense_lockfile`) yet. Go
-do that for real and use the text you got back, not a description of what it
-would contain.
+Before calling `scan_repo`, sanity-check your `lockfile_content` value: is
+it exactly the package list the condense command printed? If it looks like a
+description, a filename, angle brackets, an ellipsis, a "N lines written
+to..." notice, or **literal shell syntax you expected to be expanded**
+(e.g. `$(cat uv.lock)`, backticks, `%VAR%`) - MCP tool arguments are never
+run through a shell, nothing expands that for you - you have not actually
+run the condense command yet, or you're pasting the wrong thing. Go run it
+for real and use the text it printed.
 
-If `condense_lockfile` or `scan_repo` returns an error, read what it says -
+If the condense command or `scan_repo` returns an error, read what it says -
 the error explains what was wrong with what you sent. Do not retry the exact
 same call unchanged; it will fail the exact same way every time. Fix what
 the error describes, then call it again.

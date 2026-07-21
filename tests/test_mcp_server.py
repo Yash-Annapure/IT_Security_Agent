@@ -130,6 +130,32 @@ def test_condense_lockfile_rejects_unexpanded_shell_substitution_with_clear_erro
         mcp_server.condense_lockfile(lockfile_content="$(cat uv.lock)")
 
 
+def _http_client():
+    # The /condense custom route is registered on the same ASGI app the real server
+    # runs (streamable-http transport), so testing through that app exercises the
+    # actual wiring, not a lookalike.
+    from starlette.testclient import TestClient
+    return TestClient(mcp_server.mcp.streamable_http_app())
+
+
+def test_condense_http_endpoint_returns_condensed_lockfile():
+    resp = _http_client().post("/condense", content=UV_LOCK_TEXT.encode("utf-8"))
+    assert resp.status_code == 200
+    assert resp.text == "django==2.2.0"
+
+
+def test_condense_http_endpoint_rejects_empty_body_with_usage_hint():
+    resp = _http_client().post("/condense", content=b"")
+    assert resp.status_code == 400
+    assert "--data-binary" in resp.text
+
+
+def test_condense_http_endpoint_rejects_unparseable_content():
+    resp = _http_client().post("/condense", content=b'{"packages": {"": {}}}')
+    assert resp.status_code == 400
+    assert "No components could be parsed" in resp.text
+
+
 def test_get_connection_caches_across_calls():
     mcp_server._conn = None
     try:

@@ -66,12 +66,16 @@ mcp = FastMCP(
         "verbatim to .clinerules/scan-repo.md at that repo's root, then proceed. "
         "This is a one-time per-repo bootstrap - never call get_setup_rules if that "
         "file already exists, and never repeat this check more than once per repo. "
-        "condense_lockfile and scan_repo are both MCP tools only - never scripts, "
-        "modules, or CLI commands; call them the same way you'd call any other tool "
-        "here, never via a terminal. The only local-filesystem step in this whole "
-        "workflow is reading the lockfile itself with your own file tool - everything "
-        "after that is a tool call: condense_lockfile on the raw text, then scan_repo "
-        "on what that returns."
+        "NEVER read or open a raw lockfile (uv.lock, package-lock.json, "
+        "requirements.txt) with your file tool or print it with type/cat - raw "
+        "lockfiles are often large enough to overflow your entire context window in "
+        "one message. Instead, condense it in your terminal so only the small result "
+        "enters the conversation: curl -s -X POST <this-server-base-url>/condense "
+        "--data-binary @uv.lock (base URL = this server's MCP URL minus the /mcp "
+        "path; use curl.exe on Windows PowerShell). Then call the scan_repo MCP tool "
+        "with lockfile_content set to exactly what that printed. scan_repo and "
+        "get_setup_rules are MCP tools only, never terminal commands; the condense "
+        "curl is the one terminal step in the workflow."
     ),
 )
 
@@ -306,6 +310,34 @@ def _condense(lockfile_content: str, lockfile_type: str = "") -> str:
     return "\n".join(pypi_lines)
 
 
+@mcp.custom_route("/condense", methods=["POST"])
+async def condense_http_endpoint(request):
+    """Plain-HTTP ingress for raw lockfiles, so their bytes never transit the model.
+
+    This is the load-bearing piece of the whole context-window story: the calling
+    agent runs `curl -s -X POST <this-server>/condense --data-binary @uv.lock` in its
+    terminal, the raw file goes disk -> HTTP -> here without ever entering the model's
+    conversation, and only the few-KB condensed result (this response) appears in
+    context. The condense_lockfile MCP *tool* can't provide that property - any MCP
+    tool argument has to pass through the model's own context first, which is exactly
+    what overflowed a 32K-context model on a 618KB uv.lock in practice.
+    """
+    from starlette.responses import PlainTextResponse
+
+    body = await request.body()
+    text = body.decode("utf-8", errors="replace")
+    if not text.strip():
+        return PlainTextResponse(
+            "Empty body. POST the raw lockfile bytes, e.g.: "
+            "curl -s -X POST <this-server>/condense --data-binary @uv.lock",
+            status_code=400,
+        )
+    try:
+        return PlainTextResponse(_condense(text))
+    except ValueError as exc:
+        return PlainTextResponse(str(exc), status_code=400)
+
+
 @mcp.tool()
 def condense_lockfile(
     lockfile_content: Annotated[str, Field(description=(
@@ -323,18 +355,23 @@ def condense_lockfile(
     """Condense a raw lockfile to just name==version pairs (or the npm equivalent) -
     the only thing scan_repo's own parser ever keeps from a lockfile anyway.
 
-    Call this before scan_repo, every time, on every lockfile - then pass what this
-    returns straight into scan_repo's own lockfile_content argument. It round-trips to
-    the exact same components scan_repo would have found from the raw file, just far
-    fewer bytes: wheel/sdist download URLs and integrity hashes make a raw uv.lock or
-    package-lock.json enormous relative to what vulnerability matching actually needs -
-    on a real dependency tree, condensing typically cuts the size by 95%+. That matters
-    directly to you as the calling model: a raw lockfile can be large enough to overflow
-    your own context window in a single message.
+    IMPORTANT - do not read a large lockfile just to call this tool. Any argument you
+    pass here has to travel through your own context window first, and a real uv.lock
+    or package-lock.json is often hundreds of KB - large enough to overflow your entire
+    context in one message (this happened in practice). For any lockfile you have not
+    already got in-context, use the terminal instead: this same server exposes the same
+    condensing as a plain HTTP endpoint, so the raw bytes go straight from disk to the
+    server without ever entering the conversation:
 
-    This is an MCP tool, exactly like scan_repo - it is never a script, module, or CLI
-    command. This server has no filesystem access to the caller's machine, same as
-    scan_repo - read the lockfile yourself first, then pass its raw text here.
+        curl -s -X POST <this-server-base-url>/condense --data-binary @uv.lock
+
+    (<this-server-base-url> is this MCP server's URL from your MCP client config with
+    the trailing /mcp removed. On Windows PowerShell, use `curl.exe`, not `curl`.)
+    That command prints the condensed few-KB result; pass THAT to scan_repo. Only call
+    this MCP tool directly for small content that is already legitimately in-context.
+
+    The condensed output round-trips to the exact same components scan_repo would have
+    found from the raw file - wheel/sdist URLs and hashes were never part of matching.
 
     Args:
         lockfile_content: Raw text of a uv.lock, package-lock.json, or requirements.txt
@@ -393,10 +430,14 @@ def scan_repo(
     no way to tell. The lockfile is the only real source of truth, so every
     scan generates its own CycloneDX SBOM directly from it, every time.
 
-    This server has no filesystem access to the caller's machine - read the
-    lockfile yourself first, then pass its raw text here. Call
-    `condense_lockfile` on it first and pass what that returns instead of
-    the raw text directly - same reason, smaller payload, identical result.
+    This server has no filesystem access to the caller's machine, and you
+    should NOT read the raw lockfile into the conversation yourself either -
+    it can overflow your context window in one message. Condense it in your
+    terminal first (raw bytes go disk -> server, never through your context):
+
+        curl -s -X POST <this-server-base-url>/condense --data-binary @uv.lock
+
+    then pass exactly what that printed as `lockfile_content` here.
 
     First time in this repo? If it has no `.clinerules/scan-repo.md` yet, call
     `get_setup_rules` first and write its output there (see that tool's
@@ -511,6 +552,12 @@ def startup_banner(host: str, port: int) -> str:
             "confirmation prompt for both tools - safe to leave in, since neither writes to",
             "or executes anything on the caller's machine. Remove either name from the list",
             "if you'd rather approve those calls by hand.",
+            "",
+            "Raw-lockfile ingress (keeps big lockfiles out of the model's context):",
+            f"  curl -s -X POST http://{public_host}:{port}/condense --data-binary @uv.lock",
+            "If you reach this server through a tunnel (e.g. cloudflared), use the tunnel",
+            "hostname instead of the address above - same base URL as your Cline MCP",
+            "config, with /mcp replaced by /condense.",
             "",
             "No built-in auth - only expose this on a private/trusted network.",
         ]
