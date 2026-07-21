@@ -61,17 +61,34 @@ API key, once - after which every name is a cache hit.
 
 ```
 uv run warm_cache.py path/to/uv.lock path/to/package-lock.json   # specific files
-uv run warm_cache.py --days 90     # widen the CVE window (default 14 days)
-uv run warm_cache.py --full        # pull NVD's entire CVE catalog - see below first
+uv run warm_cache.py --days=45     # ~95% CVE coverage (see below) - do this once
+uv run warm_cache.py --full        # all ~368k CVEs; --days=45 gets ~95% for less
 ```
 
-**On `--full`:** it fetches all ~370,000 CVEs in NVD, which is ~185 sequential
-requests: 10-20 minutes with an API key, 30-45 without. You almost never want
-it - matching only consults recently-changed CVEs, which the default window
-already covers, and `--days 90` covers more still. If you do run it, pages are
-written to SQLite as they arrive (never held in memory) and progress prints
-every couple of seconds, so you can watch it work rather than guess whether
-it hung.
+**Pick your window deliberately - it's a correctness setting, not a speed one.**
+Matching can only find CVEs that are actually in the cache, so too small a
+window makes scans look reassuringly clean while simply not knowing about most
+vulnerabilities. The cache is filled by an NVD query on `lastModified`, and
+because NVD bulk re-scores old records, catalog size cliffs hard at a certain
+window. Measured against the live API:
+
+| `--days` | CVEs cached | Pages | Rough time |
+|---------:|------------:|------:|-----------|
+| 7        | 5,447       | 3     | seconds |
+| 14       | 9,321       | 5     | seconds |
+| **30** (default) | **14,672** | 8 | **~2 min** |
+| 45       | **350,485** | 176   | ~35-45 min |
+| 90       | 350,555     | 176   | ~35-45 min |
+| `--full` | 368,026     | 185   | ~35-45 min |
+
+So `--days=45` is the sweet spot: ~95% of the whole catalog in one pass, and
+anything larger buys almost nothing. The default (30) stays quick for a first
+run, and the script prints a coverage note reminding you to widen it. Re-run
+the numbers yourself if they look stale - the cliff moves as NVD re-scores.
+
+Progress prints every couple of seconds throughout (page, running total, ETA),
+and pages are written to SQLite as they arrive rather than held in memory, so
+even a full sync stays flat in RAM and never looks hung.
 
 Re-run it occasionally to pick up newly published CVEs. It's incremental -
 already-cached names are skipped, so a re-run only fetches what's new.

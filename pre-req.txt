@@ -1,5 +1,7 @@
 One-time per machine (makes scans near-instant afterwards):
-uv run warm_cache.py
+uv run warm_cache.py --days=45     ~35-45 min, caches ~95% of NVD's CVEs
+                                   (plain `uv run warm_cache.py` is a ~2 min
+                                    quick warm, but much thinner coverage)
 
 Every boot:
 uv run serve.py (For mcp)
