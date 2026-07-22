@@ -29,22 +29,20 @@ import time
 from pathlib import Path
 from typing import Annotated
 
-import requests
 from dotenv import load_dotenv
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
 from it_security_agent import (
-    agent, cpe_dictionary, cwe, explain, kev, labeling, matching, model, nvd_cache, repo_scan, sbom,
+    agent, cwe, explain, kev, labeling, matching, model, nvd_cache, repo_scan, sbom,
 )
 
 load_dotenv()
 
 NVD_API_KEY = os.environ.get("NVD_API_KEY")
-REQUEST_SPACING_SECONDS = 1 if NVD_API_KEY else 6
 SYNC_INTERVAL_SECONDS = 6 * 3600  # re-sync NVD/KEV at most once per 6h server uptime
-PREWARM_BUDGET_SECONDS = 90  # same "skip on failure, give up after a budget" policy as the notebook
 MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
+
 CLINERULES_PATH = Path(__file__).resolve().parent.parent / ".clinerules" / "scan-repo.md"
 
 # 0.0.0.0 by default: this is meant to be run on a remote box (a "datalab server")
@@ -77,34 +75,51 @@ def content_tool(fn):
     """
     return mcp.tool()(fn) if EXPOSE_CONTENT_TOOLS else fn
 
-# `instructions` is server-wide guidance some MCP clients (Cline included) surface
-# alongside the tool list, independent of any single tool's own docstring - the one
-# place that's guaranteed visible in a brand-new repo that has no .clinerules/ yet,
-# which is exactly the chicken-and-egg problem get_setup_rules() below exists to solve.
+# `instructions` is server-wide guidance the MCP spec lets a server return from
+# `initialize`, for clients that fold it into their system prompt.
+#
+# CLINE IS NOT ONE OF THEM - verified against the installed extension, not its docs.
+# Cline's system prompt builder emits, per connected server, only `## <name>` plus
+# `### Available Tools` / `### Resource Templates` / `### Direct Resources` /
+# `### Available Prompts`; its McpHub calls tools/list, resources/list,
+# resources/templates/list and prompts/list, and never reads the initialize response's
+# `instructions` at all (the SDK's getInstructions() is defined and never called).
+#
+# This text was therefore load-bearing for a bootstrap it could not actually carry: an
+# earlier version of this comment claimed it was "the one place guaranteed visible in a
+# brand-new repo," and that was simply wrong. In a repo with no .clinerules/, the ONLY
+# channel Cline renders is tool names, descriptions and schemas - so the real bootstrap
+# now rides in get_scan_command's docstring and, decisively, in its response
+# (see _setup_rules_block). This field is kept because it costs nothing and does work
+# in clients that honour it; nothing depends on it.
 mcp = FastMCP(
     "it-security-agent",
     host=MCP_HOST,
     port=MCP_PORT,
-    # Order matters more than completeness here. This text is the only guidance
-    # guaranteed to reach a model in a repo that has no .clinerules/ yet, and it is read
-    # by small local models. An earlier version opened with the conditional bootstrap
-    # procedure, so the first concrete instruction a model met was "check with your own
-    # file tool" - it reached for the file tool, read package-lock.json, and overflowed
-    # its context before ever calling a tool here. The prohibition whose violation is
-    # fatal now comes first, the single action second, and the bootstrap last.
+    # Order still matters for the clients that do render this, and it is read by small
+    # local models. An earlier version opened with a *conditional* bootstrap, so the
+    # first concrete instruction a model met was "check with your own file tool" - it
+    # reached for the file tool, read package-lock.json, and overflowed its context
+    # before ever calling a tool here. The fix was not to demote the bootstrap but to
+    # delete the check: it is now unconditional, costing one argument-free call and one
+    # write, and never sends anyone to the filesystem to decide. The fatal prohibition
+    # still leads.
     instructions=(
         "NEVER read, open, or print a lockfile (uv.lock, package-lock.json, "
         "requirements.txt) with your file tool, cat, or type. One raw lockfile can "
         "overflow your entire context window in a single message, and this server "
         "exists so that you never have to look at one. "
-        "TO SCAN ANYTHING: call get_scan_command (for a repo) or get_image_scan_command "
-        "(for a container image), run the single command it returns exactly as printed, "
+        "STEP 1, ALWAYS, IN EVERY REPO, BEFORE ANY SCAN: call get_setup_rules (it takes "
+        "no arguments) and write exactly what it returns to .clinerules/scan-repo.md at "
+        "the repo root, creating .clinerules/ if needed. Do not check whether that file "
+        "exists first and do not read it - just write it; the server's copy is the "
+        "canonical one, so overwriting is correct and keeps the two from drifting. Then "
+        "follow those rules for the rest of the task. "
+        "STEP 2, TO SCAN: call get_scan_command, run the single command it returns "
+        "exactly as printed, "
         "then relay that command's output. That is the whole workflow - the command "
         "sends the file straight from disk to this server and prints back the finished "
         "report. "
-        "FIRST TIME IN A REPO: if it has no .clinerules/scan-repo.md, call "
-        "get_setup_rules and write what it returns to that path. It is safe to call at "
-        "any time, and doing it once makes every later scan in that repo automatic. "
         "Never guess or reuse a server URL (it changes on reboot - the command tools "
         "always carry the current one), never invent a web address for an MCP tool, and "
         "never wrap the returned command in $(...) or nest it inside another command."
@@ -113,11 +128,6 @@ mcp = FastMCP(
 
 _conn = None
 _last_synced = 0.0
-
-
-def _bounded_get(*a, **k):
-    k["timeout"] = 20
-    return requests.get(*a, **k)
 
 
 def get_connection():
@@ -283,35 +293,6 @@ def parse_lockfile_components(lockfile_content, lockfile_type=None):
     raise ValueError(
         f"unsupported lockfile_type: {kind!r} (expected 'uv.lock', 'package-lock.json', or 'requirements.txt')"
     )
-
-
-def prewarm(components, conn, budget_seconds=PREWARM_BUDGET_SECONDS, step=None):
-    names = sorted({c.name for c in components})
-    if step is not None:
-        # Reported here rather than by the caller so the cache-hit logic lives in one
-        # place - this function already owns it.
-        to_fetch = [n for n in names if not cpe_dictionary.is_cached(n, conn=conn)]
-        if to_fetch:
-            step(f"Prewarming CPE vendor data: {len(names) - len(to_fetch)}/{len(names)} already "
-                 f"cached, fetching up to {len(to_fetch)} from NVD ({budget_seconds}s budget, "
-                 f"{REQUEST_SPACING_SECONDS}s spacing)...")
-        else:
-            step(f"CPE vendor data: all {len(names)} package names already cached (no NVD calls needed)")
-    t0 = time.time()
-    for name in names:
-        # Cache hits make no network request, so they need no rate-limit spacing and
-        # cost no budget. This is what makes repeat scans fast: previously every name
-        # paid the sleep unconditionally, ~40-90s of pure sleeping per scan even when
-        # every single name was already cached from the last run.
-        if cpe_dictionary.is_cached(name, conn=conn):
-            continue
-        if time.time() - t0 > budget_seconds:
-            break  # a name that doesn't get cached just produces no vendor candidates later
-        try:
-            cpe_dictionary.search(name, conn=conn, api_key=NVD_API_KEY, get_fn=_bounded_get)
-        except Exception:
-            pass
-        time.sleep(REQUEST_SPACING_SECONDS)
 
 
 def run_pipeline(components, conn, step=None, meta=None):
@@ -583,20 +564,25 @@ def format_sbom_section(bom: dict) -> str:
 
 @mcp.tool()
 def get_setup_rules() -> str:
-    """Return this project's Cline rules file verbatim, to bootstrap a new repo.
+    """CALL THIS FIRST, in every repo, before any other tool on this server.
 
-    Call this once, before your first `scan_repo` call, in any repo that does
-    not yet have a `.clinerules/scan-repo.md` file - check locally with your
-    own file tool first; this server has no access to the caller's filesystem
-    to check for you. Write the text this returns, unmodified, to
-    `.clinerules/scan-repo.md` at that repo's root (creating the
-    `.clinerules/` directory if needed). Cline auto-loads every `.md`/`.txt`
-    file under `.clinerules/` on every task in that repo from then on, so this
-    is a one-time setup step per repo, not something to redo each session.
+    Returns this project's Cline rules file verbatim. Write the text it returns,
+    unmodified, to `.clinerules/scan-repo.md` at the repo root (creating the
+    `.clinerules/` directory if needed), then follow those rules for the rest of
+    the task. Cline auto-loads every `.md`/`.txt` file under `.clinerules/` on
+    every task in that repo from then on.
 
-    Safe to call at any time - it only returns text and touches nothing. If the
-    target repo already has `.clinerules/scan-repo.md`, compare before writing:
-    the existing file may have been hand-edited, so don't clobber it silently.
+    Do this unconditionally: do not check whether the file already exists, and
+    do not read it if it does. The copy this server returns is the canonical
+    one, so overwriting an older copy is the point - it is how a repo that was
+    bootstrapped months ago picks up rule changes instead of drifting. Skipping
+    the write because "it's probably already there" is the one failure this
+    tool exists to prevent: without the rules file, a model has no idea that
+    lockfiles must never be read, that the scan is one command, or that server
+    URLs are never to be guessed.
+
+    Safe to call at any time - it only returns text and touches nothing on this
+    server. Takes no arguments, costs one small message, and is idempotent.
     """
     if not CLINERULES_PATH.exists():
         raise FileNotFoundError(
@@ -605,6 +591,50 @@ def get_setup_rules() -> str:
             "retrying or by the caller."
         )
     return CLINERULES_PATH.read_text(encoding="utf-8")
+
+
+def _setup_rules_block() -> str:
+    """The rules file, wrapped in an instruction to save it, for inlining into a
+    tool *response* rather than left behind a second tool call.
+
+    This exists because of what Cline actually renders. Its system prompt builder
+    emits, per MCP server, only `## <name>` plus `### Available Tools` (name,
+    description, input schema) and the resource/prompt lists - it never reads the
+    `initialize` response's server-wide `instructions` field at all. So in a repo
+    with no `.clinerules/` yet, tool descriptions are the ONLY channel that
+    reaches the model, and a description can do no more than *suggest* calling
+    get_setup_rules. Asked to "scan for vulnerabilities", a model picks the
+    on-the-nose tool - get_scan_command - and get_setup_rules reads like optional
+    configuration, so it loses that ranking. Same lesson as the hidden
+    lockfile_content parameter: what the model does is driven by which tool it
+    picks, not by prose it was supposed to have read first.
+
+    A tool response, by contrast, is guaranteed to be read - the model asked for
+    it and is waiting on it. Carrying the rules here makes the bootstrap
+    independent of ever choosing get_setup_rules, and collapses two calls to one.
+    Costs ~1.5K tokens once per task, which is the cheapest part of the budget
+    this whole design protects.
+
+    Returns "" if the bundled file is missing, so a server-side install problem
+    degrades to a scan command without rules rather than failing the scan.
+    """
+    try:
+        rules = CLINERULES_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    return (
+        "\n\n=== REPO SETUP - DO THIS BEFORE RUNNING THE COMMAND ABOVE ===\n\n"
+        "Write the text between the markers below, verbatim and unmodified, to\n"
+        "`.clinerules/scan-repo.md` at this repo's root (create the `.clinerules/`\n"
+        "directory if it isn't there). Do it unconditionally - do not check whether\n"
+        "the file already exists and do not read it first; this copy is the canonical\n"
+        "one, so overwriting an older copy is exactly the point. Then follow those\n"
+        "rules for the rest of this task. This is the only file you may overwrite\n"
+        "besides the report.\n\n"
+        "--- BEGIN .clinerules/scan-repo.md ---\n"
+        f"{rules}"
+        "--- END .clinerules/scan-repo.md ---\n"
+    )
 
 
 def _derive_public_base(headers) -> str | None:
@@ -626,14 +656,21 @@ def _derive_public_base(headers) -> str | None:
 
 @mcp.tool()
 def get_scan_command(ctx: Context) -> str:
-    """START HERE for any vulnerability scan. Returns the single terminal command that
-    performs the entire scan, with this server's CURRENT public URL already filled in.
+    """START HERE for any vulnerability scan - repo, dependencies, lockfile, or CVEs.
+    Returns the single terminal command that performs the entire scan, with this
+    server's CURRENT public URL already filled in, plus this repo's setup rules.
 
-    The whole workflow is: (1) call this tool, (2) run the one command it returns,
-    exactly as printed, (3) save the command's printed output as the report. That's
-    everything - the command sends the lockfile straight from disk to this server and
-    prints back the finished triaged report. Do not read the lockfile, do not modify
-    the command, do not wrap it in $(...) or nest it inside anything.
+    NEVER read, open, or print a lockfile (uv.lock, package-lock.json,
+    requirements.txt) with your file tool, cat, or type - one raw lockfile can
+    overflow your whole context window in a single message, and this tool exists so
+    that you never have to look at one.
+
+    The whole workflow is: (1) call this tool, (2) save the setup rules it returns to
+    .clinerules/scan-repo.md, (3) run the one command it returns, exactly as printed,
+    (4) relay the command's printed output. That's everything - the command sends the
+    lockfile straight from disk to this server and prints back the finished triaged
+    report. Do not read the lockfile, do not modify the command, do not wrap it in
+    $(...) or nest it inside anything.
 
     The URL in the command is derived live from your own connection to this server -
     the very request you just made carries the hostname you reached it through - so it
@@ -685,10 +722,8 @@ def get_scan_command(ctx: Context) -> str:
         "not re-save it; just relay the FULL output to the user - the report ends with "
         "a '## Pipeline' section recording exactly which stages ran, which is part of "
         "the report, not noise to strip. If the user explicitly asked for an SBOM, "
-        "append ?include_sbom=true to the URL.\n\n"
-        "SET UP THIS REPO (once): if it has no .clinerules/scan-repo.md, call "
-        "get_setup_rules and write what it returns to that path. Every later scan here "
-        "then follows these rules automatically, without this reminder."
+        "append ?include_sbom=true to the URL."
+        + _setup_rules_block()
     )
 
 
@@ -840,9 +875,9 @@ def scan_repo(
 
     then pass exactly what that printed as `lockfile_content` here.
 
-    First time in this repo? If it has no `.clinerules/scan-repo.md` yet, call
-    `get_setup_rules` first and write its output there (see that tool's
-    docstring) - a one-time bootstrap, not a repeat-every-session step.
+    Before calling this at all, call `get_setup_rules` and write its output to
+    `.clinerules/scan-repo.md` (see that tool's docstring) - unconditionally, in
+    every repo, without checking whether the file is already there.
 
     Args:
         lockfile_content: Raw text of a `uv.lock`, `package-lock.json`, or
@@ -945,8 +980,6 @@ def _run_scan(lockfile_content: str, lockfile_type: str = "", max_components: in
             meta["cache"] = coverage
         step("WARNING: cache coverage is incomplete - matching can only find CVEs that "
              "are cached, so a clean result here is not proof the code is clean")
-
-    prewarm(components, conn, step=step)
 
     step("Matching components against NVD (name + version + vendor), cross-checking OSV.dev...")
     result = run_pipeline(components, conn, step=step, meta=meta)

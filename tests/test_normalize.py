@@ -1,64 +1,122 @@
 from unittest.mock import patch
 
-from it_security_agent import normalize, nvd_cache
+from it_security_agent import normalize
 
 
-def _cpe_product(vendor, product, title, refs=None):
+def _cve(vendor, product, description="", refs=None):
+    """A cached CVE record naming (vendor, product) in its CPE configurations.
+
+    Shaped like what nvd_cache.query_by_product_name returns - resolve_vendor reads
+    vendors straight out of these now, instead of NVD's CPE dictionary API.
+    """
     return {
-        "cpe": {
-            "cpeName": f"cpe:2.3:a:{vendor}:{product}:*:*:*:*:*:*:*:*",
-            "titles": [{"lang": "en", "title": title}],
-            "refs": [{"ref": r} for r in (refs or [])],
+        "cve": {
+            "id": "CVE-0000-0001",
+            "descriptions": [{"lang": "en", "value": description}],
+            "references": [{"url": r} for r in (refs or [])],
+            "configurations": [
+                {"nodes": [{"cpeMatch": [
+                    {"criteria": f"cpe:2.3:a:{vendor}:{product}:*:*:*:*:*:*:*:*"}
+                ]}]}
+            ],
         }
     }
 
 
-def test_resolve_vendor_computes_name_similarity_and_vendor_equals_package():
-    products = [_cpe_product("djangoproject", "django", "Django web framework")]
-    with patch("it_security_agent.cpe_dictionary.search", return_value=products), \
-         patch("it_security_agent.registry.cached_fetch_metadata", return_value=None):
-        candidates = normalize.resolve_vendor("django", "PyPI")
+def _resolve(package_name, ecosystem, cves, registry_meta=None):
+    with patch("it_security_agent.nvd_cache.query_by_product_name", return_value=cves), \
+         patch("it_security_agent.registry.cached_fetch_metadata", return_value=registry_meta):
+        return normalize.resolve_vendor(package_name, ecosystem)
+
+
+def test_resolve_vendor_reads_vendor_and_product_from_the_local_cve_cache():
+    candidates = _resolve("django", "PyPI", [_cve("djangoproject", "django", "Django web framework")])
     assert len(candidates) == 1
     c = candidates[0]
     assert c.vendor == "djangoproject"
+    assert c.product == "django"
     assert c.signals["vendor_equals_package"] == 0
     assert c.signals["name_similarity"] == 1.0
 
 
+def test_resolve_vendor_makes_no_network_call():
+    # The whole point of the change: a scan must not touch NVD. query_by_product_name is
+    # the only lookup, and it is pure SQLite.
+    with patch("it_security_agent.nvd_cache.query_by_product_name", return_value=[]) as q, \
+         patch("it_security_agent.registry.cached_fetch_metadata", return_value=None):
+        assert normalize.resolve_vendor("django", "PyPI") == []
+    assert q.called
+
+
+def test_resolve_vendor_deduplicates_a_vendor_seen_across_several_cves():
+    # A popular package appears in dozens of CVEs, all naming the same vendor/product.
+    # That must produce one candidate, not one per CVE.
+    cves = [_cve("djangoproject", "django", "first"), _cve("djangoproject", "django", "second")]
+    assert len(_resolve("django", "PyPI", cves)) == 1
+
+
+def test_resolve_vendor_ignores_cpes_for_a_different_product():
+    # query_by_product_name returns whole CVE records, and one CVE can name many
+    # products - only the CPEs whose product field is the package may contribute.
+    cve = _cve("djangoproject", "django")
+    cve["cve"]["configurations"][0]["nodes"][0]["cpeMatch"].append(
+        {"criteria": "cpe:2.3:a:someoneelse:flask:*:*:*:*:*:*:*:*"}
+    )
+    vendors = {c.vendor for c in _resolve("django", "PyPI", [cve])}
+    assert vendors == {"djangoproject"}
+
+
+def test_resolve_vendor_scores_ecosystem_keywords_from_the_cve_description():
+    # The CPE title used to supply this text; the description replaces it and says
+    # "npm package" far more often than a title does.
+    candidates = _resolve("lodash", "npm", [_cve("lodash", "lodash", "The npm package lodash for Node.js")])
+    signals = candidates[0].signals
+    assert signals["js_keyword_score"] > 0
+    assert signals["keyword_alignment"] > 0
+
+
+def test_resolve_vendor_keyword_score_counts_presence_not_repetition():
+    # Scores must describe the package, not how many CVEs mention it - otherwise a
+    # widely-reported package scores higher purely for being widely reported.
+    once = _resolve("lodash", "npm", [_cve("lodash", "lodash", "nodejs")])
+    many = _resolve("lodash", "npm", [_cve("lodash", "lodash", "nodejs nodejs nodejs")])
+    assert once[0].signals["js_keyword_score"] == many[0].signals["js_keyword_score"]
+
+
 def test_resolve_vendor_registry_overlap_true_when_domains_match():
-    products = [_cpe_product("djangoproject", "django", "Django", refs=["https://github.com/django/django"])]
-    registry_meta = {"urls": ["https://github.com/django/django"]}
-    with patch("it_security_agent.cpe_dictionary.search", return_value=products), \
-         patch("it_security_agent.registry.cached_fetch_metadata", return_value=registry_meta):
-        candidates = normalize.resolve_vendor("django", "PyPI")
+    candidates = _resolve("django", "PyPI",
+                          [_cve("djangoproject", "django", refs=["https://github.com/django/django"])],
+                          registry_meta={"urls": ["https://github.com/django/django"]})
     assert candidates[0].signals["registry_overlap"] is True
 
 
 def test_resolve_vendor_registry_overlap_none_when_no_registry_data():
-    products = [_cpe_product("djangoproject", "django", "Django")]
-    with patch("it_security_agent.cpe_dictionary.search", return_value=products), \
-         patch("it_security_agent.registry.cached_fetch_metadata", return_value=None):
-        candidates = normalize.resolve_vendor("django", "PyPI")
+    candidates = _resolve("django", "PyPI", [_cve("djangoproject", "django")])
     assert candidates[0].signals["registry_overlap"] is None
 
 
 def test_resolve_vendor_registry_overlap_true_for_npm_git_prefixed_url():
     # npm registry returns repository URLs like "git+https://github.com/lodash/lodash.git";
-    # _domain must normalize these to match a plain CPE reference so overlap is detected.
-    products = [_cpe_product("lodash", "lodash", "Lodash", refs=["https://github.com/lodash/lodash"])]
-    registry_meta = {"urls": ["git+https://github.com/lodash/lodash.git"]}
-    with patch("it_security_agent.cpe_dictionary.search", return_value=products), \
-         patch("it_security_agent.registry.cached_fetch_metadata", return_value=registry_meta):
-        candidates = normalize.resolve_vendor("lodash", "npm")
+    # _domain must normalize these to match a plain CVE reference so overlap is detected.
+    candidates = _resolve("lodash", "npm",
+                          [_cve("lodash", "lodash", refs=["https://github.com/lodash/lodash"])],
+                          registry_meta={"urls": ["git+https://github.com/lodash/lodash.git"]})
     assert candidates[0].signals["registry_overlap"] is True
 
 
 def test_resolve_vendor_does_not_combine_signals_into_a_score():
-    products = [_cpe_product("djangoproject", "django", "Django")]
-    with patch("it_security_agent.cpe_dictionary.search", return_value=products), \
-         patch("it_security_agent.registry.cached_fetch_metadata", return_value=None):
-        candidates = normalize.resolve_vendor("django", "PyPI")
+    candidates = _resolve("django", "PyPI", [_cve("djangoproject", "django")])
     assert not hasattr(candidates[0], "score")
+
+
+def test_resolve_vendor_looks_up_every_name_spelling():
+    # matching.find_candidates searches all three spellings; resolve_vendor must look up
+    # the same ones or a vendor it finds would have no candidate attached to it.
+    with patch("it_security_agent.nvd_cache.query_by_product_name", return_value=[]) as q, \
+         patch("it_security_agent.registry.cached_fetch_metadata", return_value=None):
+        normalize.resolve_vendor("python-dateutil", "PyPI")
+    assert {call.args[0] for call in q.call_args_list} == set(
+        normalize.name_variants("python-dateutil"))
 
 
 # Weakness regression: _domain() used to collapse any URL down to its bare hosting
@@ -85,11 +143,9 @@ def test_domain_still_matches_the_same_repo_with_a_different_path_suffix():
 
 def test_resolve_vendor_registry_overlap_false_for_different_repos_same_host():
     # Integration-level version of the two unit checks above: babel's real collision
-    # (Week 2/3) - PyPI's babel points at python-babel/babel, the npm collision's CPE
-    # ref points at babel/babel. Same host, different project; must not overlap.
-    products = [_cpe_product("babel", "babel", "Babel", refs=["https://github.com/babel/babel/tags"])]
-    registry_meta = {"urls": ["https://github.com/python-babel/babel"]}
-    with patch("it_security_agent.cpe_dictionary.search", return_value=products), \
-         patch("it_security_agent.registry.cached_fetch_metadata", return_value=registry_meta):
-        candidates = normalize.resolve_vendor("babel", "PyPI")
+    # (Week 2/3) - PyPI's babel points at python-babel/babel, the CVE reference points
+    # at babel/babel. Same host, different project; must not overlap.
+    candidates = _resolve("babel", "PyPI",
+                          [_cve("babel", "babel", refs=["https://github.com/babel/babel/tags"])],
+                          registry_meta={"urls": ["https://github.com/python-babel/babel"]})
     assert candidates[0].signals["registry_overlap"] is False

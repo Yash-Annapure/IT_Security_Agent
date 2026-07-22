@@ -33,7 +33,7 @@ through the same parser a third-party SBOM would use -> scan).
 | **Runs on a small local model** | Lockfiles never enter the model's context - disk -> `curl` -> server. This repo's own is 618KB, ~4x a 32K window. | `POST /scan`, `get_scan_command` |
 | **Input can't be doctored** | Lockfile only; the SBOM is always rebuilt server-side. A supplied SBOM is a claim, and a claim can omit a vulnerable package. | `sbom.to_cyclonedx` |
 | **Two independent sources** | OSV.dev queried separately - can confirm a match the model doubted, or flag one it was sure about. | `osv.py` |
-| **Drops into any repo** | The rules file is served by the tool that installs it, so the two copies never drift. | `get_setup_rules` |
+| **Drops into any repo** | The scan tool's own response carries the rules file, so a fresh repo bootstraps itself without depending on the model reading server metadata Cline never shows it. | `_setup_rules_block`, `get_setup_rules` |
 | **Reproducible** | 223 tests, ~94% coverage, every external call mocked - never touches a live API. | `tests/` |
 
 The whole workflow, once set up:
@@ -71,18 +71,27 @@ first `scan_repo` call) takes several times longer.
 uv run warm_cache.py
 ```
 
-Pre-populates `nvd_cache.db` with the NVD CVE window, the CISA KEV feed, and
-CPE vendor data for every package in your lockfile(s), so scans afterwards
-hit the local cache instead of the network. Worth doing once per machine
-right after `uv sync`.
+Pre-populates `nvd_cache.db` with the NVD CVE window and the CISA KEV feed,
+so scans afterwards hit the local cache instead of the network. Worth doing
+once per machine right after `uv sync`.
 
-This matters because CPE vendor lookups are the slowest part of a scan and
-NVD rate-limits them (1s/request with an API key, 6s without). The server
-prewarms them inside each scan under a 90s budget, so a large lockfile
-converges over several scans; this script does the same fetching with no
-budget cap and no timeout pressure, and prints per-package progress with an
-up-front ETA. On this repo (151 unique names) that's ~2.5 minutes with an
-API key, once - after which every name is a cache hit.
+It takes no lockfile argument, and that is the point: warming is per-machine,
+not per-repo. Once the catalog is cached, every lockfile scans against it -
+`uv.lock`, `requirements.txt` and `package-lock.json` alike.
+
+That used to be false. `resolve_vendor` called NVD's *CPE dictionary* API
+once per package name to find out which vendor a package belongs to - rate
+limited to 1 request/sec with an API key (6 without), behind a 90s in-scan
+budget. A repo's own `uv.lock` felt fine because its names had been cached by
+earlier runs; a fresh 257-package `package-lock.json` needed ~250 of those
+calls, blew the budget, and stalled. Nothing about npm was different - only
+what happened to be cached.
+
+None of it was needed. A cached CVE record already contains the full CPE 2.3
+URI of every product it affects, and the vendor is field 3 of that string -
+`matching.find_candidates` had always read it back that way. With the whole
+catalog local, `normalize.resolve_vendor` now reads vendors straight out of
+the cache, so **a scan makes no NVD requests at all**.
 
 ```
 uv run warm_cache.py path/to/uv.lock path/to/package-lock.json   # specific files
@@ -125,7 +134,9 @@ tool, `scan_repo`, over Streamable HTTP - so it can run on a remote machine
 (e.g. your datalab server, next to a self-hosted LLM) and be registered as a
 remote MCP server in Cline. A `.clinerules/` directory at the repo root
 already tells Cline's model how and when to call it - no extra prompt setup
-needed (the JSON config shape and rules-directory format below were verified
+needed, and in any *other* repo the model installs that same file itself as
+its first step (see "Using it against a different repo", below). (The JSON
+config shape and rules-directory format below were verified
 against Cline's own source, not just its docs - both have changed recently).
 
 ### On the datalab server
@@ -233,9 +244,9 @@ actions, and `.clinerules/` walks the model through them:
 
 The stream is the transparency layer: rather than an opaque wait, you watch
 the actual pipeline work - components parsed, CycloneDX SBOM generated,
-NVD/KEV sync state, how many package names were already CPE-cached vs
-fetched, LogisticRegression-vs-RandomForest training and which model won at
-what threshold, SHAP explainer construction, and the final triage counts.
+NVD/KEV cache coverage, LogisticRegression-vs-RandomForest training and which
+model won at what threshold, SHAP explainer construction, and the final
+triage counts.
 The same log is appended to the saved report as a `## Pipeline` section, so
 every report is a record of exactly which stages ran and how long each took.
 
@@ -343,24 +354,59 @@ vulnerabilities works immediately - except that other repo won't have this
 project's `.clinerules/scan-repo.md` yet, so the model won't know the
 lockfile-first workflow, the "no pre-made SBOM" rule, etc.
 
-A second tool, `get_setup_rules`, closes that gap: the server-wide MCP
-`instructions` field (sent to the client alongside the tool list, so it's
-visible even in a repo with no `.clinerules/` at all) tells the model that if
-the repo has no `.clinerules/scan-repo.md`, it should call `get_setup_rules`
-and write the returned text there - a one-time per-repo bootstrap, after
-which every later scan in that repo follows the rules automatically. The same
-reminder is appended to `get_scan_command`'s output, which is where a model
-reliably reads it: by then it is already holding a command it intends to run,
-rather than skimming server metadata.
-
-The text it returns is read straight from this repo's own
+**`get_scan_command`'s response carries the rules file itself**, so the model
+saves it to `.clinerules/scan-repo.md` and then runs the command it already
+has in hand. The text is read straight from this repo's own
 `.clinerules/scan-repo.md`, so the two never drift - edit that one file and
-both this project's Cline setup and every newly-bootstrapped repo pick up the
-change.
+both this project's Cline setup and every bootstrapped repo pick up the
+change on its next task. `get_setup_rules` still exists and returns the same
+text, for clients that can be told to call it.
 
-Order matters in that `instructions` text, and getting it wrong was a real
-bug. An earlier version opened with the bootstrap procedure, so the first
-concrete instruction a model met was *"check locally with your own file
-tool"* - it reached for the file tool, read `package-lock.json`, and blew its
-context before reaching the sentence forbidding exactly that. The prohibition
-now comes first, the single action second, the bootstrap last.
+**Why it rides in a tool response and not in server metadata.** The obvious
+place for this is the MCP `initialize` response's server-wide `instructions`
+field, and an earlier version of this README claimed that's where it lived -
+*"sent to the client alongside the tool list, so it's visible even in a repo
+with no `.clinerules/` at all."* That was wrong, and checking the installed
+extension rather than the docs is what showed it: **Cline never reads
+`instructions` at all.** Its system prompt builder emits, per connected
+server, only `## <name>` plus `### Available Tools` (name, description,
+schema), `### Resource Templates`, `### Direct Resources` and
+`### Available Prompts`; `McpHub` calls `tools/list`, `resources/list`,
+`resources/templates/list` and `prompts/list`, and the MCP SDK's
+`getInstructions()` is defined but never called anywhere in the bundle. The
+bootstrap was resting on a channel that does not exist.
+
+What's left in a fresh repo is tool names, descriptions and schemas - and a
+description can only *suggest* calling `get_setup_rules`. That suggestion
+loses: asked to "scan for vulnerabilities," a model picks the on-the-nose
+tool, and `get_setup_rules` reads like optional configuration. It's the same
+lesson as the hidden `lockfile_content` parameter, in the other direction -
+behaviour follows which tool gets picked, not prose that was meant to be read
+first. A tool *response* is the one thing guaranteed to be read, because the
+model asked for it and is waiting on it. So the rules go there. It costs
+~2.2K tokens once per task, and it makes the bootstrap independent of the
+model ever choosing the bootstrap tool.
+
+**Why it's unconditional, and why it overwrites.** Both follow from one bug.
+An earlier version was conditional - *"if the repo has no
+`.clinerules/scan-repo.md`…"* - so the first concrete instruction a model met
+was *"check locally with your own file tool."* It reached for the file tool,
+read `package-lock.json`, and blew its context before reaching the sentence
+forbidding exactly that. The conditional was the defect: a model that has to
+*decide* whether to bootstrap will sometimes decide wrong, and the cost is a
+whole task run with no rules at all. With the check gone the step is one
+write, with nothing to get wrong. Overwriting is then a feature - the
+server's copy is canonical, so a repo bootstrapped months ago re-syncs
+instead of drifting.
+
+**The layer before that.** Even a tool response only arrives once the model
+has decided to call a tool, and "check this repo for vulnerabilities" invites
+reading a lockfile before that point. The only channel that lands *ahead* of
+the first tool call is the system prompt, so `serve_mistral.py` appends
+`SCAN_BOOTSTRAP` to it (next to the existing `AGENT_REINFORCEMENT`): don't
+read lockfiles, and reach for `get_scan_command` first. It's deliberately
+short - the real rules arrive with that tool's response, where there's room
+for them. This covers models served through `serve_mistral.py`; pointing
+Cline at a hosted model instead loses it, in which case put the same text in
+Cline's global **Custom Instructions** setting, which applies across every
+repo.

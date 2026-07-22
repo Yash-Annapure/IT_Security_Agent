@@ -10,9 +10,9 @@ def parse_version(text):
         return None
 
 
-def name_variants(name):
-    n = name.lower()
-    return sorted({n, n.replace("-", "_"), n.replace("_", "-")})
+# Defined in normalize so resolve_vendor looks up the same spellings this does;
+# re-exported here because callers and tests reach for matching.name_variants.
+name_variants = normalize.name_variants
 
 
 def version_applies(m, pinned):

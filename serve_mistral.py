@@ -222,6 +222,34 @@ AGENT_REINFORCEMENT = (
     "reply now, do not ask again."
 )
 
+# The bootstrap of last resort, for a repo that has no .clinerules/ yet.
+#
+# Cline does not surface an MCP server's `instructions` field at all (verified in the
+# extension bundle: its prompt builder emits only the per-server tool/resource/prompt
+# lists, and the SDK's getInstructions() is never called). So in a brand-new repo,
+# nothing the server says about itself reaches the model until the model has already
+# chosen to call one of its tools - and "scan this repo for vulnerabilities" invites
+# reading the lockfile long before any tool gets picked. That ordering is the whole
+# problem: by the time the rules would arrive, the context is already blown.
+#
+# This is the only channel that lands ahead of the first tool call, because it is
+# injected into the system prompt itself rather than fetched. It deliberately says as
+# little as possible - the prohibition, and which tool to reach for - and leaves the
+# real rules to arrive with that tool's response, where there is room for them.
+#
+# Scope: this only covers models served through this file. Pointing Cline at a hosted
+# model instead loses it, in which case put the same text in Cline's global "Custom
+# Instructions" setting, which applies across every repo.
+SCAN_BOOTSTRAP = (
+    "\n\nVULNERABILITY SCANS: if the user asks about vulnerabilities, CVEs, dependency "
+    "security, an SBOM, or scanning this repo, your FIRST action is to call the "
+    "it-security-agent MCP server's get_scan_command tool. Never read, open, print or "
+    "cat a lockfile (uv.lock, package-lock.json, requirements.txt) for any reason - a "
+    "single one can overflow your entire context window, and that tool exists so you "
+    "never have to. Its response carries both the command to run and a rules file to "
+    "save to .clinerules/scan-repo.md; do both, in that order, then follow those rules."
+)
+
 
 def _normalize_messages(messages: list[dict]) -> list[dict]:
     normalized = []
@@ -231,7 +259,7 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
             m["content"] = _flatten_content(m["content"])
         normalized.append(m)
     if normalized and normalized[0].get("role") == "system" and isinstance(normalized[0].get("content"), str):
-        normalized[0]["content"] += AGENT_REINFORCEMENT
+        normalized[0]["content"] += AGENT_REINFORCEMENT + SCAN_BOOTSTRAP
     return normalized
 
 

@@ -53,12 +53,6 @@ def test_parse_lockfile_components_rejects_unknown_lockfile_type():
         mcp_server.parse_lockfile_components(UV_LOCK_TEXT, lockfile_type="Pipfile.lock")
 
 
-def test_bounded_get_sets_a_20s_timeout():
-    with patch.object(mcp_server.requests, "get", return_value="response") as mock_get:
-        result = mcp_server._bounded_get("http://example.test", headers={})
-    assert result == "response"
-    assert mock_get.call_args.kwargs["timeout"] == 20
-
 
 def test_get_setup_rules_returns_the_bundled_clinerules_file_verbatim():
     on_disk = mcp_server.CLINERULES_PATH.read_text(encoding="utf-8")
@@ -229,10 +223,33 @@ def test_get_scan_command_asks_the_user_when_no_request_is_available():
     assert "/scan" in text  # still explains the command shape
 
 
+def test_get_scan_command_carries_the_rules_file_inline():
+    # The bootstrap cannot depend on the model choosing get_setup_rules. Cline never
+    # renders the server's `instructions` field, and asked to "scan for
+    # vulnerabilities" a model reaches for the on-the-nose tool - this one. So the
+    # rules must ride in the response of the tool it actually calls.
+    ctx = _fake_ctx({"host": "example.test", "x-forwarded-proto": "https"})
+    text = mcp_server.get_scan_command(ctx)
+    rules = mcp_server.CLINERULES_PATH.read_text(encoding="utf-8")
+    assert rules in text                                   # verbatim, not paraphrased
+    assert ".clinerules/scan-repo.md" in text
+    assert "BEFORE RUNNING THE COMMAND ABOVE" in text
+    # ...and the command itself still comes first, so it isn't buried under the rules.
+    assert text.index("curl.exe") < text.index("BEGIN .clinerules")
+
+
+def test_setup_rules_block_degrades_to_empty_when_the_bundled_file_is_missing():
+    # A server-side install problem must cost the rules, not the scan: get_scan_command
+    # still has to hand back a working command.
+    with patch.object(mcp_server, "CLINERULES_PATH", Path("nonexistent") / "scan-repo.md"):
+        assert mcp_server._setup_rules_block() == ""
+        text = mcp_server.get_scan_command(_fake_ctx({"host": "example.test"}))
+    assert "http://example.test/scan" in text
+
+
 def test_scan_http_endpoint_returns_the_finished_report():
     with patch.object(mcp_server, "get_connection", return_value="conn"), \
          patch.object(mcp_server, "_ensure_synced"), \
-         patch.object(mcp_server, "prewarm"), \
          patch.object(mcp_server, "run_pipeline", return_value=None), \
          patch.object(mcp_server, "raw_matches", return_value=[]):
         resp = _http_client().post("/scan", content=UV_LOCK_TEXT.encode("utf-8"))
@@ -244,7 +261,6 @@ def test_scan_http_endpoint_returns_the_finished_report():
 def test_scan_http_endpoint_includes_sbom_only_when_requested():
     with patch.object(mcp_server, "get_connection", return_value="conn"), \
          patch.object(mcp_server, "_ensure_synced"), \
-         patch.object(mcp_server, "prewarm"), \
          patch.object(mcp_server, "run_pipeline", return_value=None), \
          patch.object(mcp_server, "raw_matches", return_value=[]):
         resp = _http_client().post("/scan?include_sbom=true", content=UV_LOCK_TEXT.encode("utf-8"))
@@ -269,7 +285,6 @@ def test_scan_http_endpoint_rejects_unparseable_content_before_streaming():
 def test_scan_http_endpoint_streams_keepalive_header_before_the_report():
     with patch.object(mcp_server, "get_connection", return_value="conn"), \
          patch.object(mcp_server, "_ensure_synced"), \
-         patch.object(mcp_server, "prewarm"), \
          patch.object(mcp_server, "run_pipeline", return_value=None), \
          patch.object(mcp_server, "raw_matches", return_value=[]):
         resp = _http_client().post("/scan", content=UV_LOCK_TEXT.encode("utf-8"))
@@ -291,7 +306,6 @@ def test_scan_http_endpoint_scans_every_component_with_no_cap():
     )
     with patch.object(mcp_server, "get_connection", return_value="conn"), \
          patch.object(mcp_server, "_ensure_synced"), \
-         patch.object(mcp_server, "prewarm"), \
          patch.object(mcp_server, "run_pipeline", return_value=None), \
          patch.object(mcp_server, "raw_matches", return_value=[]) as mock_raw:
         resp = _http_client().post("/scan", content=lock.encode("utf-8"))
@@ -306,7 +320,6 @@ def test_scan_http_endpoint_streams_live_pipeline_progress():
     # CPE cache state, matching, triage) as they happen - not an opaque wait.
     with patch.object(mcp_server, "get_connection", return_value="conn"), \
          patch.object(mcp_server, "_ensure_synced"), \
-         patch.object(mcp_server, "prewarm"), \
          patch.object(mcp_server, "run_pipeline", return_value=None), \
          patch.object(mcp_server, "raw_matches", return_value=[]):
         resp = _http_client().post("/scan", content=UV_LOCK_TEXT.encode("utf-8"))
@@ -389,7 +402,6 @@ def test_a_complete_cache_scans_offline_without_syncing():
     with patch.object(mcp_server, "get_connection", return_value="conn"), \
          patch.object(mcp_server, "_cache_coverage", return_value=dict(FULL_CACHE)), \
          patch.object(mcp_server, "_ensure_synced") as mock_sync, \
-         patch.object(mcp_server, "prewarm"), \
          patch.object(mcp_server, "run_pipeline", return_value=ScanResult()):
         text = mcp_server.scan_repo(lockfile_content=UV_LOCK_TEXT, include_sbom=False)
     mock_sync.assert_not_called()
@@ -409,37 +421,7 @@ def test_ensure_synced_syncs_when_stale():
         mcp_server._last_synced = 0.0
 
 
-def test_prewarm_calls_cpe_search_per_unique_name():
-    components = [
-        Component(name="django", version="1.0", ecosystem="PyPI", source="t"),
-        Component(name="django", version="2.0", ecosystem="PyPI", source="t"),  # duplicate name
-        Component(name="flask", version="1.0", ecosystem="PyPI", source="t"),
-    ]
-    with patch.object(mcp_server.cpe_dictionary, "is_cached", return_value=False), \
-         patch.object(mcp_server.cpe_dictionary, "search") as mock_search, \
-         patch.object(mcp_server.time, "sleep"):
-        mcp_server.prewarm(components, conn="conn")
-    assert {call.args[0] for call in mock_search.call_args_list} == {"django", "flask"}
 
-
-def test_prewarm_swallows_search_failures():
-    components = [Component(name="broken", version="1.0", ecosystem="PyPI", source="t")]
-    with patch.object(mcp_server.cpe_dictionary, "is_cached", return_value=False), \
-         patch.object(mcp_server.cpe_dictionary, "search", side_effect=Exception("boom")), \
-         patch.object(mcp_server.time, "sleep"):
-        mcp_server.prewarm(components, conn="conn")  # must not raise
-
-
-def test_prewarm_stops_at_time_budget():
-    components = [
-        Component(name="a", version="1.0", ecosystem="PyPI", source="t"),
-        Component(name="b", version="1.0", ecosystem="PyPI", source="t"),
-    ]
-    with patch.object(mcp_server.cpe_dictionary, "is_cached", return_value=False), \
-         patch.object(mcp_server.cpe_dictionary, "search") as mock_search, \
-         patch.object(mcp_server.time, "sleep"):
-        mcp_server.prewarm(components, conn="conn", budget_seconds=-1)  # already "expired"
-    mock_search.assert_not_called()
 
 
 def test_run_pipeline_trains_and_scans_when_dataset_has_both_classes():
@@ -476,7 +458,6 @@ def test_scan_repo_returns_triaged_summary_when_pipeline_succeeds():
     sentinel_result = ScanResult(confirmed=[_finding()])
     with patch.object(mcp_server, "get_connection", return_value="conn"), \
          patch.object(mcp_server, "_ensure_synced"), \
-         patch.object(mcp_server, "prewarm"), \
          patch.object(mcp_server, "run_pipeline", return_value=sentinel_result):
         text = mcp_server.scan_repo(lockfile_content=UV_LOCK_TEXT, include_sbom=False)
     assert text.startswith(mcp_server.format_summary(sentinel_result, {
@@ -492,7 +473,6 @@ def test_scan_repo_omits_generated_sbom_by_default():
     # every routine vulnerability check when nobody asked for it.
     with patch.object(mcp_server, "get_connection", return_value="conn"), \
          patch.object(mcp_server, "_ensure_synced"), \
-         patch.object(mcp_server, "prewarm"), \
          patch.object(mcp_server, "run_pipeline", return_value=None), \
          patch.object(mcp_server, "raw_matches", return_value=[]):
         text = mcp_server.scan_repo(lockfile_content=UV_LOCK_TEXT)
@@ -502,7 +482,6 @@ def test_scan_repo_omits_generated_sbom_by_default():
 def test_scan_repo_includes_generated_sbom_when_requested():
     with patch.object(mcp_server, "get_connection", return_value="conn"), \
          patch.object(mcp_server, "_ensure_synced"), \
-         patch.object(mcp_server, "prewarm"), \
          patch.object(mcp_server, "run_pipeline", return_value=None), \
          patch.object(mcp_server, "raw_matches", return_value=[]):
         text = mcp_server.scan_repo(lockfile_content=UV_LOCK_TEXT, include_sbom=True)
@@ -520,7 +499,6 @@ def test_scan_repo_generated_sbom_covers_full_list_not_just_scanned_subset():
     )
     with patch.object(mcp_server, "get_connection", return_value="conn"), \
          patch.object(mcp_server, "_ensure_synced"), \
-         patch.object(mcp_server, "prewarm"), \
          patch.object(mcp_server, "run_pipeline", return_value=None), \
          patch.object(mcp_server, "raw_matches", return_value=[]):
         text = mcp_server.scan_repo(lockfile_content=lock, max_components=2, include_sbom=True)
@@ -538,24 +516,6 @@ def test_main_runs_streamable_http_transport():
     mock_sync.assert_called_once()  # NVD/KEV sync kicks off at startup, not on first scan
 
 
-def test_prewarm_skips_sleep_and_network_for_cached_names():
-    components = [Component(name="django", version="2.2.0", ecosystem="PyPI", source="t")]
-    with patch.object(mcp_server.cpe_dictionary, "is_cached", return_value=True), \
-         patch.object(mcp_server.cpe_dictionary, "search") as mock_search, \
-         patch.object(mcp_server.time, "sleep") as mock_sleep:
-        mcp_server.prewarm(components, conn="conn")
-    mock_search.assert_not_called()
-    mock_sleep.assert_not_called()
-
-
-def test_prewarm_fetches_and_spaces_requests_for_uncached_names():
-    components = [Component(name="django", version="2.2.0", ecosystem="PyPI", source="t")]
-    with patch.object(mcp_server.cpe_dictionary, "is_cached", return_value=False), \
-         patch.object(mcp_server.cpe_dictionary, "search") as mock_search, \
-         patch.object(mcp_server.time, "sleep") as mock_sleep:
-        mcp_server.prewarm(components, conn="conn")
-    mock_search.assert_called_once()
-    mock_sleep.assert_called_once()
 
 
 def test_detect_reachable_host_returns_an_ip_on_success():
@@ -647,7 +607,6 @@ def test_scan_repo_truncates_to_max_components():
     )
     with patch.object(mcp_server, "get_connection", return_value="conn"), \
          patch.object(mcp_server, "_ensure_synced"), \
-         patch.object(mcp_server, "prewarm"), \
          patch.object(mcp_server, "run_pipeline", return_value=None), \
          patch.object(mcp_server, "raw_matches", return_value=[]) as mock_raw:
         mcp_server.scan_repo(lockfile_content=lock, max_components=2)

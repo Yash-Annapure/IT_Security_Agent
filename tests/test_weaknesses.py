@@ -20,10 +20,10 @@ from it_security_agent import agent, explain, labeling, matching, model, normali
 from it_security_agent.normalize import VendorCandidate
 from it_security_agent.schema import Component
 
-# The four real Week 2 name collisions, reproduced with the actual registry/CPE
+# The four real Week 2 name collisions, reproduced with the actual registry/advisory
 # URLs observed live against the NVD API (see conversation history / week3_agent.ipynb
 # Section 7): each pair is (this project's real registry URLs, the unrelated
-# collision's CPE reference URLs). All four are same-name, cross-ecosystem or
+# collision's reference URLs). All four are same-name, cross-ecosystem or
 # cross-project collisions - exactly what registry_overlap exists to catch.
 REAL_COLLISIONS = {
     "babel": (["https://babel.pocoo.org/", "https://github.com/python-babel/babel"],
@@ -38,12 +38,15 @@ REAL_COLLISIONS = {
 @pytest.mark.parametrize("name", sorted(REAL_COLLISIONS))
 def test_known_week2_collisions_no_longer_show_registry_overlap(name):
     reg_urls, ref_urls = REAL_COLLISIONS[name]
-    products = [{"cpe": {
-        "cpeName": f"cpe:2.3:a:collidingvendor:{name}:*:*:*:*:*:*:*:*",
-        "titles": [{"lang": "en", "title": name}],
-        "refs": [{"ref": r} for r in ref_urls],
+    cves = [{"cve": {
+        "id": f"CVE-0000-{name}",
+        "descriptions": [{"lang": "en", "value": name}],
+        "references": [{"url": r} for r in ref_urls],
+        "configurations": [{"nodes": [{"cpeMatch": [
+            {"criteria": f"cpe:2.3:a:collidingvendor:{name}:*:*:*:*:*:*:*:*"}
+        ]}]}],
     }}]
-    with patch("it_security_agent.cpe_dictionary.search", return_value=products), \
+    with patch("it_security_agent.nvd_cache.query_by_product_name", return_value=cves), \
          patch("it_security_agent.registry.cached_fetch_metadata", return_value={"urls": reg_urls}):
         candidates = normalize.resolve_vendor(name, "PyPI")
     assert candidates[0].signals["registry_overlap"] is False, (

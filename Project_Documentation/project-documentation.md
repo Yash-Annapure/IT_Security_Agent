@@ -56,7 +56,7 @@ paper over it.
                                   └────────────────┬────────────────────────┘
                                                    ▼
                                   ┌─────────────────────────────────────────┐
-   package registry ─────────────▶│  3. IDENTIFY   normalize, cpe_dictionary│
+   package registry ─────────────▶│  3. IDENTIFY   normalize               │
    (PyPI / npm homepage URLs)     │     which CPE vendor is really this     │
                                   │     package? (the collision problem)    │
                                   └────────────────┬────────────────────────┘
@@ -92,8 +92,7 @@ paper over it.
 | `kev.py` | CISA's actively-exploited list. |
 | `osv.py` | OSV.dev, used as an independent second opinion. |
 | `registry.py` | Fetches a package's homepage URLs from PyPI/npm. |
-| `cpe_dictionary.py` | NVD's vendor/product dictionary. |
-| `normalize.py` | Turns a package name into candidate CPE vendors, with signals. |
+| `normalize.py` | Turns a package name into candidate CPE vendors, with signals — read out of the cached CVE records, so no NVD call. |
 | `matching.py` | Finds candidate CVEs and applies version-range logic. |
 | `labeling.py` | Builds the training set and defines the seven features. |
 | `model.py` | Trains logistic regression vs random forest, picks the winner. |
@@ -157,7 +156,7 @@ specific piece of the architecture rather than to effort or tuning.
 | **Works with a small local model** | Dependency files never enter the model's context — they travel disk → `curl` → server. A 618KB lockfile would be ~4× a 32K window on its own. | `POST /scan`, `get_scan_command` |
 | **The input cannot be doctored** | Only a lockfile is accepted; the SBOM is always rebuilt server-side. A supplied SBOM is a claim, and a claim can omit a vulnerable package. | `sbom.to_cyclonedx`, `_unsupported_input_reason` |
 | **Two independent sources** | OSV.dev is queried separately and can confirm a match the model was unsure about, or flag one it was confident about. | `osv.py`, `report.osv_agreement_summary` |
-| **Drops into any repo** | The rules file is served by the tool that installs it, so a new project bootstraps itself and the two copies never drift. | `get_setup_rules`, `.clinerules/scan-repo.md` |
+| **Drops into any repo** | The scan tool's own response carries the rules file, so a fresh project bootstraps itself — the one channel guaranteed to be read, since Cline never surfaces an MCP server's `instructions`. | `_setup_rules_block`, `.clinerules/scan-repo.md` |
 | **Reproducible** | 223 tests, ~94% coverage, every external call mocked — the suite never touches a live API or spends rate limit. | `tests/` |
 
 ### The workflow, end to end

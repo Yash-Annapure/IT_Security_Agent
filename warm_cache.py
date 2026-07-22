@@ -1,8 +1,7 @@
-"""Pre-populate the local NVD/KEV/CPE cache so scans don't fetch anything at scan time.
+"""Pre-populate the local NVD/KEV cache so scans don't fetch anything at scan time.
 
     uv run warm_cache.py                  # quick warm (30-day CVE window, ~2 min)
     uv run warm_cache.py --days=45        # ~95% CVE coverage, ~35-45 min - do this once
-    uv run warm_cache.py path/to/uv.lock path/to/package-lock.json
     uv run warm_cache.py --full           # all ~368k CVEs; --days=45 gets ~95% for less
     uv run warm_cache.py --full --workers=6   # more concurrency; 4 (with an API key) by default
 
@@ -10,17 +9,16 @@ Everything lands in `nvd_cache.db` (SQLite, repo root - the same file the server
 so this is a one-time cost per machine rather than a per-scan one. Run it once after
 cloning, and again occasionally to pick up newly published CVEs.
 
-Why this exists, and why the window size matters:
+Why the window size matters: matching can only find CVEs that are actually in the local
+cache. The cache is filled by an NVD query on `lastModified`, so a 14-day window holds
+only whatever NVD happened to touch in the last two weeks - a few percent of the
+catalog. Scans against that will look reassuringly clean while simply not knowing about
+most vulnerabilities. A wider window is a correctness setting, not a performance one.
 
-  * Matching can only find CVEs that are actually in the local cache. The cache is
-    filled by an NVD query on `lastModified`, so a 14-day window holds only whatever
-    NVD happened to touch in the last two weeks - a few percent of the catalog. Scans
-    against that will look reassuringly clean while simply not knowing about most
-    vulnerabilities. A wider window is a correctness setting, not a performance one.
-  * CPE vendor lookups are the slowest per-scan step, and NVD rate-limits them (1
-    request/sec with an API key, 6 without). The server prewarms them inside each scan
-    under a 90s budget, so a large lockfile converges over several scans; this script
-    does the same fetching with no budget cap, so afterwards every name is a local hit.
+This takes no lockfile argument, and deliberately: warming is per-machine, not per-repo.
+It used to also fetch NVD's CPE dictionary once per package name, which is what made it
+repo-specific - but vendors are read out of the cached CVE records themselves now (see
+normalize.resolve_vendor), so a warmed catalog serves every lockfile equally.
 
 Set NVD_API_KEY in .env first if you have one (free from https://nvd.nist.gov/developers
 /request-an-api-key): it makes everything here ~6x faster.
@@ -30,17 +28,14 @@ import os
 import sys
 import time
 from functools import partial
-from pathlib import Path
 
 from dotenv import load_dotenv
 
-from it_security_agent import cpe_dictionary, kev, nvd_cache, nvd_client
-from it_security_agent.mcp_server import parse_lockfile_components
+from it_security_agent import kev, nvd_cache, nvd_client
 
 load_dotenv()
 
 NVD_API_KEY = os.environ.get("NVD_API_KEY")
-REQUEST_SPACING_SECONDS = 1 if NVD_API_KEY else 6
 # 30 days is the largest window that stays quick. NVD bulk re-scores old records, and
 # as of this writing a re-scoring event ~35-40 days back means the catalog size cliffs
 # hard just past it - measured against the live API:
@@ -49,7 +44,6 @@ REQUEST_SPACING_SECONDS = 1 if NVD_API_KEY else 6
 # So --days 45 is the "near-complete coverage" setting and anything beyond it buys
 # almost nothing extra. Re-measure with --coverage if these numbers look stale.
 DEFAULT_DAYS = 30
-DEFAULT_LOCKFILES = ["uv.lock", "package-lock.json", "requirements.txt"]
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -61,7 +55,7 @@ def _db_stats(conn) -> dict:
     """Row counts per table, tolerating tables that don't exist yet on a fresh DB."""
     stats = {}
 
-    for table in ("cves", "kev", "cpe_dictionary", "cve_products"):
+    for table in ("cves", "kev", "cve_products"):
         try:
             stats[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         except Exception:
@@ -75,8 +69,7 @@ def _db_stats(conn) -> dict:
 
 def _print_stats(label: str, stats: dict) -> None:
     print(f"  {label}: {stats['cves']:,} CVEs, {stats['kev']:,} known-exploited, "
-          f"{stats['cpe_dictionary']:,} CPE names, {stats['cve_products']:,} indexed "
-          f"CPE products ({stats['size_mb']:.1f} MB)", flush=True)
+          f"{stats['cve_products']:,} indexed CPE products ({stats['size_mb']:.1f} MB)", flush=True)
 
 
 def _coverage_line(stats: dict) -> str:
@@ -87,25 +80,6 @@ def _coverage_line(stats: dict) -> str:
                "simply aren't here" if fraction < 0.5 else
                "usable, but still incomplete" if fraction < 0.9 else "good")
     return f"  Coverage: ~{fraction:.0%} of NVD's ~368,000 CVEs - {verdict}."
-
-
-def _collect_names(paths: list[Path]) -> list[str]:
-    names: set[str] = set()
-    for path in paths:
-        try:
-            components = parse_lockfile_components(path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            print(f"  ! skipping {path}: {exc}", flush=True)
-            continue
-        if not components:
-            # Unrecognized text falls through to the requirements.txt parser, which
-            # returns [] rather than raising - say so instead of silently ignoring it.
-            print(f"  ! skipping {path}: no components parsed (unrecognized lockfile format?)", flush=True)
-            continue
-        ecosystems = sorted({c.ecosystem for c in components})
-        print(f"  {path}: {len(components)} components ({', '.join(ecosystems)})", flush=True)
-        names.update(c.name for c in components)
-    return sorted(names)
 
 
 def _sync_reporter(started_at: float):
@@ -135,39 +109,7 @@ def _sync_reporter(started_at: float):
     return report
 
 
-def warm_cpe(names: list[str], conn) -> tuple[int, int]:
-    """Fetch CPE vendor data for every name not already cached. Returns (fetched, failed)."""
-    todo = [n for n in names if not cpe_dictionary.is_cached(n, conn=conn)]
-    cached = len(names) - len(todo)
-    print(f"\nCPE vendor data: {cached}/{len(names)} already cached, {len(todo)} to fetch", flush=True)
-    if not todo:
-        return 0, 0
-
-    eta = len(todo) * REQUEST_SPACING_SECONDS
-    print(f"  ~{_fmt_duration(eta)} at {REQUEST_SPACING_SECONDS}s/request"
-          f"{'' if NVD_API_KEY else ' (no NVD_API_KEY - 6x slower than it needs to be)'}\n", flush=True)
-
-    started = time.time()
-    fetched = failed = 0
-    for i, name in enumerate(todo, start=1):
-        try:
-            products = cpe_dictionary.search(name, conn=conn, api_key=NVD_API_KEY)
-            fetched += 1
-            status = f"ok ({len(products)} CPE entries)" if products else "ok (no CPE entries - unknown to NVD)"
-        except Exception as exc:
-            failed += 1
-            status = f"FAILED ({type(exc).__name__}: {exc})"
-        remaining = (len(todo) - i) * REQUEST_SPACING_SECONDS
-        print(f"  [{i:>4}/{len(todo)}] {name:<32} {status}"
-              f"{'' if not remaining else f'   (~{_fmt_duration(remaining)} left)'}", flush=True)
-        if i < len(todo):
-            time.sleep(REQUEST_SPACING_SECONDS)
-    print(f"  CPE pass finished in {_fmt_duration(time.time() - started)}", flush=True)
-    return fetched, failed
-
-
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = [a for a in sys.argv[1:] if a.startswith("--")]
     full = "--full" in flags
     days = DEFAULT_DAYS
@@ -180,12 +122,6 @@ def main():
             _, _, value = flag.partition("=")
             workers = max(1, int(value)) if value else workers
 
-    paths = [Path(a) for a in args] or [Path(n) for n in DEFAULT_LOCKFILES if Path(n).exists()]
-    if not paths:
-        print("No lockfile found. Pass one explicitly, e.g.: uv run warm_cache.py path/to/uv.lock",
-              file=sys.stderr)
-        sys.exit(1)
-
     started = time.time()
     print(f"Cache database: {nvd_cache.DB_PATH}", flush=True)
     print("  (opening - a cache built before the CPE product index is backfilled now)", flush=True)
@@ -193,13 +129,6 @@ def main():
     before = _db_stats(conn)
     _print_stats("before", before)
     print(_coverage_line(before), flush=True)
-
-    print("\nReading lockfiles:", flush=True)
-    names = _collect_names(paths)
-    if not names:
-        print("No components parsed from any lockfile - nothing to warm.", file=sys.stderr)
-        sys.exit(1)
-    print(f"  -> {len(names)} unique package names to look up", flush=True)
 
     fetch_fn = partial(nvd_client.fetch_all_pages_parallel, workers=workers)
     if full:
@@ -230,17 +159,12 @@ def main():
     kev_count = kev.refresh(conn=conn)
     print(f"  -> {kev_count:,} known-exploited CVEs", flush=True)
 
-    fetched, failed = warm_cpe(names, conn)
-
     after = _db_stats(conn)
     print(f"\nCache warm in {_fmt_duration(time.time() - started)}.", flush=True)
     _print_stats("before", before)
     _print_stats(" after", after)
     print(_coverage_line(after), flush=True)
-    if failed:
-        print(f"  {failed} CPE lookup(s) failed - those names just yield fewer vendor "
-              f"candidates when matching. Re-run to retry them.", flush=True)
-    print("\nScans against these lockfiles should now hit the local cache for every package.")
+    print("\nScans now run entirely against this cache - no NVD requests at scan time.")
 
 
 if __name__ == "__main__":
