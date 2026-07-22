@@ -241,6 +241,25 @@ def _unsupported_input_reason(content: str) -> str | None:
                 "records version *ranges* (\"^1.2.3\"), and a range cannot be matched "
                 "against NVD's affected-version ranges - only an exact pinned version "
                 "can. Send package-lock.json instead.")
+    # An npm lockfile that is structurally perfect and simply empty. `npm install` run
+    # in a directory with no package.json writes exactly this stub - 91 bytes, valid
+    # lockfileVersion 3, `"packages": {}` - and it then shadows the project's real
+    # lockfile in a subdirectory. That happened: an agent ran `npm install` at a repo
+    # root, npm errored on the missing package.json but left the stub behind, and every
+    # subsequent scan of that root reported "no components" while the actual 258-package
+    # lockfile sat untouched in `my-app/`. Without this branch the message gives a
+    # caller nothing to act on, and the next thing it tries is opening the lockfile.
+    if "lockfileVersion" in data and not data.get("packages") and not data.get("dependencies"):
+        return ("this is a valid but EMPTY npm lockfile - it pins no packages at all, so "
+                "there is nothing to scan. This is what `npm install` leaves behind when "
+                "it is run in a directory with no package.json, and it will shadow your "
+                "real lockfile. The project's actual package-lock.json is almost "
+                "certainly in a SUBDIRECTORY (client/, frontend/, my-app/, ...). Find it "
+                "WITHOUT opening it - e.g. `Get-ChildItem -Recurse -Filter package-lock.json "
+                "-Exclude node_modules` on PowerShell, `find . -name package-lock.json "
+                "-not -path '*/node_modules/*'` on bash - then re-run the scan command "
+                "with that path after the @, e.g. \"@my-app/package-lock.json\". Never "
+                "read or print a lockfile to find this out; the file listing is enough.")
     return None
 
 
@@ -310,7 +329,14 @@ def run_pipeline(components, conn, step=None, meta=None):
             step(message)
 
     dataset = labeling.build_dataset(components, conn=conn)
-    if dataset.empty or dataset["label_real_match"].nunique() < 2:
+    # Two distinct labels is not enough: model.train_and_compare does a *stratified*
+    # split, and sklearn refuses to stratify a class with a single member ("The least
+    # populated classes in y have only 1 member"). That raised out of the scan entirely
+    # - no report at all, just an ERROR line - on a real 257-package package-lock.json
+    # that produced 7 candidate matches with a 6/1 label split. Small npm projects land
+    # here easily, so the fallback to untriaged raw matches has to cover it too.
+    if dataset.empty or dataset["label_real_match"].value_counts().min() < 2 \
+            or dataset["label_real_match"].nunique() < 2:
         return None
     report(f"Built training set: {len(dataset)} candidate matches, {len(labeling.FEATURES)} features")
     report("Training + comparing LogisticRegression vs RandomForest (risk weighting FN x10 + FP x1)...")
@@ -651,36 +677,63 @@ def get_scan_command(ctx: Context) -> str:
     # decision from the caller, and it keeps the command a single copy-paste unit that
     # both shows progress and saves the report.
     report_path = f"reports/{datetime.date.today():%Y-%m-%d}-scan.md"
+    win_report = report_path.replace("/", chr(92))
+    # The lockfile is DISCOVERED by the shell, not named by the caller. Picking the
+    # filename used to be the one edit a caller was allowed to make, and it is the one
+    # that went wrong: a monorepo kept its real 258-package lockfile in `my-app/`, an
+    # agent scanning the root found only an empty stub `npm install` had left there,
+    # got "no components", and opened the 133KB file to investigate - ending the task
+    # at 39,369 tokens. Every step of that was a decision the caller should never have
+    # been asked to make, so the command now makes none: it searches the tree and
+    # picks the largest lockfile, which is why an empty stub can never win over a real
+    # one. It prints the path it chose, so the choice stays auditable.
+    ps_find = (
+        "$lock = Get-ChildItem -Recurse -File -Include uv.lock,package-lock.json,"
+        "requirements.txt -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.FullName -notmatch '\\\\(node_modules|\\.venv|\\.git)\\\\' } | "
+        "Sort-Object Length -Descending | Select-Object -First 1"
+    )
+    sh_find = (
+        "lock=$(find . \\( -name node_modules -o -name .venv -o -name .git \\) -prune "
+        "-o -type f \\( -name uv.lock -o -name package-lock.json -o -name requirements.txt \\) "
+        "-print0 | xargs -0 ls -S 2>/dev/null | head -1)"
+    )
     return (
-        "Run exactly ONE of these in the terminal, as printed - substituting only the "
-        "lockfile filename after the @ if it isn't uv.lock:\n\n"
-        f"  Windows PowerShell (use this one on Windows - plain `curl` will NOT work "
-        f"there):\n    New-Item -ItemType Directory -Force reports, .clinerules | Out-Null; "
+        "Run exactly ONE of these in the terminal, EXACTLY as printed. There is nothing "
+        "to substitute - it finds the lockfile itself, anywhere in the repo:\n\n"
+        "  Windows PowerShell (use this one on Windows - plain `curl` will NOT work "
+        "there):\n    "
+        "New-Item -ItemType Directory -Force reports, .clinerules | Out-Null; "
         f"curl.exe -s {base}/rules -o .clinerules/scan-repo.md; "
-        f"curl.exe -sN -X POST {base}/scan --data-binary \"@uv.lock\" | "
-        f"Tee-Object -Variable report; "
-        f"[IO.File]::WriteAllLines(\"$PWD\\{report_path.replace('/', chr(92))}\", $report)\n\n"
-        f"  bash / zsh (Linux/macOS):\n    mkdir -p reports .clinerules && "
+        f"{ps_find}; "
+        "if (-not $lock) { 'No lockfile found under ' + $PWD } else { "
+        "'Scanning ' + $lock.FullName; "
+        f"curl.exe -sN -X POST {base}/scan --data-binary \"@$($lock.FullName)\" | "
+        "Tee-Object -Variable report; "
+        f"[IO.File]::WriteAllLines(\"$PWD\\{win_report}\", $report) }}\n\n"
+        "  bash / zsh (Linux/macOS):\n    mkdir -p reports .clinerules && "
         f"curl -s {base}/rules -o .clinerules/scan-repo.md && "
-        f"curl -sN -X POST {base}/scan --data-binary @uv.lock | tee {report_path}\n\n"
-        "The quotes around \"@uv.lock\" are REQUIRED on PowerShell - an unquoted @ is "
-        "a parse error there. Copy them exactly.\n\n"
-        "DO NOT redirect this with `>`, and do not simplify the PowerShell line. Each "
-        f"part earns its place: `Tee-Object -Variable` shows every pipeline stage on "
-        f"screen as it happens while capturing the text, and `[IO.File]::WriteAllLines` "
-        f"writes {report_path} as plain UTF-8. A `>` redirect hides all the progress "
+        f"{sh_find} && echo \"Scanning $lock\" && "
+        f"curl -sN -X POST {base}/scan --data-binary @\"$lock\" | tee {report_path}\n\n"
+        "It searches the whole tree (skipping node_modules/.venv/.git) and takes the "
+        "LARGEST lockfile, then prints which one it picked. Largest, because a repo can "
+        "hold an empty stub - `npm install` writes one when there is no package.json - "
+        "and a stub must never beat the project's real lockfile in a subdirectory. If it "
+        "prints 'No lockfile found', tell the user; do not go looking by hand.\n\n"
+        "DO NOT redirect this with `>`, and do not simplify it. Each part earns its "
+        "place: `Tee-Object -Variable` shows every pipeline stage on screen as it happens "
+        "while capturing the text, and `[IO.File]::WriteAllLines` writes "
+        f"{report_path} as plain UTF-8. A `>` redirect hides all the progress "
         "AND writes UTF-16 on some PowerShell hosts, which doubles the file size and "
         "makes git treat the report as binary. `-N` stops curl buffering, so stages "
         "appear as they happen rather than all at once at the end.\n\n"
-        "The first curl writes this repo's rules to .clinerules/scan-repo.md. Leave it "
-        "in - it is how a new repo gets set up, it costs one HTTP request, and the file "
-        "must never be retyped by hand (a model asked to reproduce it verbatim truncated "
-        "it and lost the reporting rules). Do not read that file back; running the "
-        "command is the whole of the setup.\n\n"
+        "The first curl writes this repo's rules to .clinerules/scan-repo.md - that is "
+        "the whole of the repo setup, and the file must never be retyped by hand. Do not "
+        "read it back.\n\n"
         "You will see stages stream in - SBOM generation, cache coverage, model "
         "training, SHAP, triage - then the finished report; usually seconds, up "
         "to ~2 minutes on the first run after a server restart. Wait for it to finish, "
-        f"don't retry or cancel. The file is already saved by the time it ends, so do "
+        "don't retry or cancel. The file is already saved by the time it ends, so do "
         "not re-save it; just relay the FULL output to the user - the report ends with "
         "a '## Pipeline' section recording exactly which stages ran, which is part of "
         "the report, not noise to strip. If the user explicitly asked for an SBOM, "
@@ -1029,9 +1082,17 @@ async def scan_http_endpoint(request):
         components = parse_lockfile_components(text)
         if not components:
             reason = _unsupported_input_reason(text)
+            # The no-reason fallback still has to end in an instruction. A bare "no
+            # components could be parsed" is a dead end, and the observed next move
+            # after a dead end is to open the lockfile - which ends the task.
             return PlainTextResponse(
                 f"No components could be parsed - {reason}" if reason
-                else "No components could be parsed from the provided lockfile.",
+                else ("No components could be parsed from the provided lockfile. Do NOT "
+                      "open or print it to investigate - that overflows your context and "
+                      "tells you nothing this message doesn't. Check you sent the right "
+                      "file: search the repo for lockfiles in subdirectories (excluding "
+                      "node_modules) and re-run the scan command with that path after "
+                      "the @."),
                 status_code=400)
     except Exception as exc:
         return PlainTextResponse(f"Could not parse lockfile: {exc}", status_code=400)

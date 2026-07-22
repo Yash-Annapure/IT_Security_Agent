@@ -293,10 +293,13 @@ def run_generate(messages: list[dict], tools: list[dict] | None, max_new_tokens:
             detail=(
                 f"Prompt is {input_len} tokens, over this server's {MAX_INPUT_TOKENS}-token "
                 f"limit (kept safely under the model's real 32768-token context, leaving "
-                f"room to actually generate a response). This almost always means a full "
-                f"raw lockfile ended up in the conversation instead of a condensed one - "
-                f"run condense_lockfile.py on it first (see README.md and "
-                f".clinerules/scan-repo.md) rather than reading the raw file directly."
+                f"room to actually generate a response). This almost always means a raw "
+                f"lockfile was read into the conversation. Start a NEW task - this one "
+                f"cannot recover, because the oversized content is already in its history. "
+                f"In the new task, never open a lockfile: run the command get_scan_command "
+                f"returns, which streams the file from disk to the server so it never "
+                f"enters context. If the lockfile is not at the repo root, find its path "
+                f"with a file listing (not by reading it) and put that path after the @."
             ),
         )
 

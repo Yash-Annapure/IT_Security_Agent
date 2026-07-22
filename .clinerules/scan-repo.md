@@ -67,9 +67,22 @@ user to switch to Act mode instead of re-describing the plan.
   reporting rules below. `curl` copies it exactly and costs nothing.
 - **If a command or tool call fails, read the error** - it says exactly
   what was wrong. Fix that. Never retry the identical call unchanged.
-- If there is no lockfile at the project root, say so and ask the user
-  where their dependency file lives - do not guess or substitute another
-  file.
+- **Never run `npm install`, `uv sync`, `pip install` or any other install
+  command.** Scanning reads a lockfile; it never builds anything. `npm
+  install` in a directory with no `package.json` still leaves behind an
+  empty `package-lock.json` that then shadows the project's real one, and
+  every scan afterwards reports "no components" - that has happened.
+- **If the lockfile isn't at the repo root, find it - don't guess and don't
+  ask.** Monorepos keep it in a subdirectory (`my-app/`, `client/`,
+  `frontend/`). List, never open: `Get-ChildItem -Recurse -Filter
+  package-lock.json` on PowerShell (or `find . -name package-lock.json -not
+  -path '*/node_modules/*'` on bash), then put that path after the `@`, e.g.
+  `"@my-app/package-lock.json"`. A file *listing* is safe; the file is not.
+  Only ask the user if the search finds nothing at all.
+- **"No components could be parsed" is never a reason to open the file.**
+  It means the file you sent pins nothing - usually an empty stub at the
+  root while the real lockfile is in a subdirectory. Search for the other
+  lockfiles and send one of those.
 
 ## Reporting rules
 

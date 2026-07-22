@@ -153,6 +153,30 @@ def test_an_sbom_is_rejected_with_the_reason_it_is_refused():
         json.dumps({"spdxVersion": "SPDX-2.3", "packages": []}))
 
 
+def test_the_empty_stub_npm_leaves_behind_is_named_as_the_problem():
+    # Verbatim the 91-byte file `npm install` wrote at a portfolio repo's root after
+    # erroring on a missing package.json. It is a structurally perfect lockfile that
+    # pins nothing, and it shadowed the project's real 258-package lockfile in my-app/.
+    # Every scan reported "no components"; with no reason given, the agent eventually
+    # opened the real lockfile to investigate and blew its context at 39,369 tokens.
+    stub = json.dumps({"name": "My-Portfolio", "lockfileVersion": 3,
+                       "requires": True, "packages": {}})
+    assert mcp_server.parse_lockfile_components(stub) == []
+    reason = mcp_server._unsupported_input_reason(stub)
+    assert reason is not None, "the empty-stub case must not fall through to a bare error"
+    assert "EMPTY" in reason
+    assert "npm install" in reason              # says where it came from
+    assert "SUBDIRECTORY" in reason             # says where the real one is
+    assert "Never read or print a lockfile" in reason
+
+
+def test_an_empty_uv_style_lock_also_gets_a_reason():
+    # Same failure shape, non-npm: lockfileVersion present, nothing pinned either way.
+    reason = mcp_server._unsupported_input_reason(
+        json.dumps({"lockfileVersion": 2, "packages": {}, "dependencies": {}}))
+    assert reason is not None and "EMPTY" in reason
+
+
 def test_a_real_package_lock_is_not_flagged_as_unsupported():
     text = json.dumps({"lockfileVersion": 3, "packages": {
         "": {"name": "demo"}, "node_modules/lodash": {"version": "4.17.15"}}})
@@ -345,8 +369,12 @@ def test_scan_http_endpoint_streams_live_pipeline_progress():
 
 
 def test_run_pipeline_reports_model_training_details_through_step():
+    # Two of each label: the real minimum, because train_and_compare stratifies its
+    # train/test split and sklearn cannot stratify a single-member class.
     two_class_df = pd.DataFrame([
         {**{f: 0.0 for f in mcp_server.labeling.FEATURES}, "label_real_match": True},
+        {**{f: 0.0 for f in mcp_server.labeling.FEATURES}, "label_real_match": True},
+        {**{f: 1.0 for f in mcp_server.labeling.FEATURES}, "label_real_match": False},
         {**{f: 1.0 for f in mcp_server.labeling.FEATURES}, "label_real_match": False},
     ])
     seen = []
@@ -440,8 +468,12 @@ def test_ensure_synced_syncs_when_stale():
 
 
 def test_run_pipeline_trains_and_scans_when_dataset_has_both_classes():
+    # Two of each label: the real minimum, because train_and_compare stratifies its
+    # train/test split and sklearn cannot stratify a single-member class.
     two_class_df = pd.DataFrame([
         {**{f: 0.0 for f in mcp_server.labeling.FEATURES}, "label_real_match": True},
+        {**{f: 0.0 for f in mcp_server.labeling.FEATURES}, "label_real_match": True},
+        {**{f: 1.0 for f in mcp_server.labeling.FEATURES}, "label_real_match": False},
         {**{f: 1.0 for f in mcp_server.labeling.FEATURES}, "label_real_match": False},
     ])
     components = [Component(name="django", version="2.2.0", ecosystem="PyPI", source="t")]
@@ -635,6 +667,33 @@ def test_run_pipeline_returns_none_when_dataset_has_a_single_class():
     with patch.object(mcp_server.labeling, "build_dataset", return_value=single_class_df):
         result = mcp_server.run_pipeline([Component(name="x", version="1.0", ecosystem="PyPI", source="t")], conn=None)
     assert result is None
+
+
+def test_run_pipeline_returns_none_when_a_class_has_only_one_member():
+    # The 6/1 label split a real 257-package package-lock.json produced. Both classes
+    # are present, so the nunique() guard passes - but train_and_compare stratifies its
+    # split, and sklearn raises on a single-member class. That escaped as an ERROR with
+    # no report at all. Small npm projects hit this shape routinely.
+    lopsided = pd.DataFrame(
+        [{**{f: 0.0 for f in mcp_server.labeling.FEATURES}, "label_real_match": True}
+         for _ in range(6)]
+        + [{**{f: 0.0 for f in mcp_server.labeling.FEATURES}, "label_real_match": False}])
+    assert lopsided["label_real_match"].nunique() == 2  # the old guard would let this through
+    with patch.object(mcp_server.labeling, "build_dataset", return_value=lopsided):
+        result = mcp_server.run_pipeline(
+            [Component(name="x", version="1.0", ecosystem="npm", source="t")], conn=None)
+    assert result is None, "must fall back to untriaged raw matches, not raise"
+
+
+def test_train_and_compare_would_actually_raise_on_that_split(tmp_path):
+    # Pins the reason the guard exists: without it, this is the exception that reached
+    # the user instead of a report.
+    lopsided = pd.DataFrame(
+        [{**{f: 0.0 for f in mcp_server.labeling.FEATURES}, "label_real_match": 1}
+         for _ in range(6)]
+        + [{**{f: 0.0 for f in mcp_server.labeling.FEATURES}, "label_real_match": 0}])
+    with pytest.raises(ValueError, match="least populated class"):
+        mcp_server.model.train_and_compare(lopsided, model_dir=tmp_path)
 
 
 def _finding(cve="CVE-2024-0001", confidence=0.9, explanation=None):
