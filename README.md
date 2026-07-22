@@ -240,7 +240,8 @@ actions, and `.clinerules/` walks the model through them:
 2. Run that command - it POSTs the lockfile straight from disk to the
    server's `/scan` endpoint, streams live pipeline progress as each stage
    runs, and prints the finished triaged report.
-3. Save the printed report to `reports/<date>-scan.md`.
+3. The same command saves the full report to `reports/<date>-scan.md` and
+   the generated SBOM to `reports/<date>-sbom.cdx.json`.
 
 The stream is the transparency layer: rather than an opaque wait, you watch
 the actual pipeline work - components parsed, CycloneDX SBOM generated,
@@ -284,11 +285,15 @@ collisions (`babel` vs Babel.js, `click` vs Ubuntu's Click, `jupyter` twice
 vs VS Code) out of `confirmed` and into `review_queue`, without demoting the
 one genuine finding - nothing is dropped, it just gets a human's eyes.
 
-If you ask for "an SBOM," the model appends `?include_sbom=true` to the
-scan URL and a real CycloneDX document (not a description of one) comes
-back inline with the findings. There is no way to pass in a pre-made SBOM,
-by design (see the tamper-proofing note above) - `.clinerules/` also tells
-the model not to go looking for one.
+Every scan also saves the CycloneDX SBOM it generated - a real document,
+not a description of one - to `reports/<date>-sbom.cdx.json`, fetched from
+`/sbom` by the same command that fetched the report. It costs the model
+nothing because it goes disk → server → disk, so there is nothing to ask
+for: the artifact is simply there, and the summary names the path. (The
+`?include_sbom=true` query param still embeds the same JSON in the report
+body for callers that want a single response.) There is no way to pass in
+a pre-made SBOM, by design (see the tamper-proofing note above) -
+`.clinerules/` also tells the model not to go looking for one.
 
 ### Keeping lockfiles out of the model's context entirely
 
