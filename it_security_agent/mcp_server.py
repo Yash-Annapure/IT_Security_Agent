@@ -1025,7 +1025,7 @@ async def sbom_http_endpoint(request):
     /scan?include_sbom=true still embeds the same JSON in the report body for callers
     that want one single response; this route is what the standard workflow uses.
     """
-    from starlette.responses import JSONResponse, PlainTextResponse
+    from starlette.responses import PlainTextResponse, Response
 
     body = await request.body()
     text = body.decode("utf-8", errors="replace")
@@ -1047,7 +1047,14 @@ async def sbom_http_endpoint(request):
             f"No components could be parsed - {reason}" if reason
             else "No components could be parsed from the provided lockfile - no SBOM to build.",
             status_code=400)
-    return JSONResponse(sbom.to_cyclonedx(components, bom_name="scan_repo"))
+    # Indented rather than JSONResponse's minified default: this response is written
+    # straight to disk as a file a human opens, and a one-line document tens of KB wide
+    # is unreadable in an editor. It costs a few percent on the wire and nothing in
+    # context, since the bytes never pass through the model.
+    return Response(
+        json.dumps(sbom.to_cyclonedx(components, bom_name="scan_repo"), indent=2),
+        media_type="application/json",
+    )
 
 
 @content_tool

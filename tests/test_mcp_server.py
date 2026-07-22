@@ -466,6 +466,9 @@ def test_sbom_endpoint_returns_the_generated_cyclonedx_document():
     bom = resp.json()
     assert bom["bomFormat"] == "CycloneDX"
     assert [c["name"] for c in bom["components"]] == ["django"]
+    # ...pretty-printed, because it lands on disk as a file a human opens: minified
+    # JSON is one line tens of KB wide, which only scrolls sideways in an editor.
+    assert '\n  "bomFormat"' in resp.text
 
 
 def test_sbom_endpoint_covers_every_component_with_no_scan_cap():
