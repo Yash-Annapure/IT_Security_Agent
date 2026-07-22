@@ -450,6 +450,11 @@ _DISPLAY_GROUPS = [
 _DISPLAY_PATTERN = "|".join(_DISPLAY_GROUPS)
 # grep -E has no \d, and anchors each alternative itself rather than sharing one ^.
 _DISPLAY_PATTERN_POSIX = "|".join(g.replace(r"\d", "[0-9]") for g in _DISPLAY_GROUPS)
+# The PowerShell copy spells the fence as \x60{3} instead of three literal backticks.
+# Identical to .NET's regex engine, but it keeps the command itself backtick-free, so a
+# model can quote it inside a Markdown code fence without the fence closing early and
+# taking the tail of the command - the part that ends the line - with it.
+_DISPLAY_PATTERN_PS = _DISPLAY_PATTERN.replace("^```", r"^\x60{3}")
 
 
 def _summary_rows(findings, limit) -> list:
@@ -872,16 +877,23 @@ def get_scan_command(ctx: Context) -> str:
         "New-Item -ItemType Directory -Force reports, .clinerules | Out-Null; "
         f"curl.exe -s {base}/rules -o .clinerules/scan-repo.md; "
         f"{ps_find}; "
-        "if (-not $lock) { 'No lockfile found under ' + $PWD } else { "
+        # A `throw` guard, NOT `if/else`. The else form wrapped everything after it in a
+        # block whose closing `}` was the last character of a 1200-character line, and a
+        # relayed copy that lost that one character did not fail - PowerShell decided the
+        # statement was incomplete and sat at its `>>` continuation prompt forever, which
+        # reads as a hung scan rather than a syntax error. `throw` aborts the remaining
+        # `;`-separated statements on its own, so every brace closes within a few words of
+        # opening and the line ends on a plain string literal that cannot be unbalanced.
+        "if (-not $lock) { throw ('No lockfile found under ' + $PWD) }; "
         "'Scanning ' + $lock.FullName; "
         f"curl.exe -sN -X POST {base}/scan --data-binary \"@$($lock.FullName)\" | "
         "Tee-Object -Variable report | "
-        f"Select-String -Pattern '{_DISPLAY_PATTERN}' | "
+        f"Select-String -Pattern '{_DISPLAY_PATTERN_PS}' | "
         "ForEach-Object { $_.Line }; "
         f"[IO.File]::WriteAllLines(\"$PWD\\{win_report}\", $report); "
         f"curl.exe -s -X POST {base}/sbom --data-binary \"@$($lock.FullName)\" "
         f"-o {win_sbom}; "
-        f"'--- report: {report_path} | SBOM: {sbom_path} ---' }}\n\n"
+        f"'--- report: {report_path} | SBOM: {sbom_path} ---'\n\n"
         "  bash / zsh (Linux/macOS):\n    mkdir -p reports .clinerules && "
         f"curl -s {base}/rules -o .clinerules/scan-repo.md && "
         f"{sh_find} && echo \"Scanning $lock\" && "
@@ -894,6 +906,8 @@ def get_scan_command(ctx: Context) -> str:
         "hold an empty stub - `npm install` writes one when there is no package.json - "
         "and a stub must never beat the project's real lockfile in a subdirectory. If it "
         "prints 'No lockfile found', tell the user; do not go looking by hand.\n\n"
+        "Paste it as ONE line. A `>>` prompt instead of output means the paste was "
+        "truncated, not that the scan is slow: press Ctrl+C and paste it again whole.\n\n"
         "DO NOT redirect it with `>` and do not simplify it. `Tee-Object`/`tee` captures "
         f"the FULL report to {report_path}; the filter decides only what reaches your "
         "screen. A `>` redirect hides the progress and writes UTF-16 on some PowerShell "
