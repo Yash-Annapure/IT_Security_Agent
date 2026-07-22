@@ -223,28 +223,43 @@ def test_get_scan_command_asks_the_user_when_no_request_is_available():
     assert "/scan" in text  # still explains the command shape
 
 
-def test_get_scan_command_carries_the_rules_file_inline():
-    # The bootstrap cannot depend on the model choosing get_setup_rules. Cline never
-    # renders the server's `instructions` field, and asked to "scan for
-    # vulnerabilities" a model reaches for the on-the-nose tool - this one. So the
-    # rules must ride in the response of the tool it actually calls.
+def test_get_scan_command_fetches_the_rules_with_curl_rather_than_inlining_them():
+    # The rules must reach disk without passing through the model. Inlining them cost
+    # ~2.2K tokens of response plus ~1.7K of regenerated output per scan - and a local
+    # model asked to retype 6KB truncated it at line 64 of 113, silently dropping the
+    # reporting rules. A curl writes the same bytes for zero tokens, byte-exact.
     ctx = _fake_ctx({"host": "example.test", "x-forwarded-proto": "https"})
     text = mcp_server.get_scan_command(ctx)
     rules = mcp_server.CLINERULES_PATH.read_text(encoding="utf-8")
-    assert rules in text                                   # verbatim, not paraphrased
-    assert ".clinerules/scan-repo.md" in text
-    assert "BEFORE RUNNING THE COMMAND ABOVE" in text
-    # ...and the command itself still comes first, so it isn't buried under the rules.
-    assert text.index("curl.exe") < text.index("BEGIN .clinerules")
+    assert rules not in text                     # the file's text must NOT be in context
+    assert "https://example.test/rules -o .clinerules/scan-repo.md" in text
+    # Setup must precede the scan in the command, and both shells must do it.
+    assert text.index("/rules") < text.index("/scan")
+    assert "New-Item -ItemType Directory -Force reports, .clinerules" in text
+    assert "mkdir -p reports .clinerules" in text
 
 
-def test_setup_rules_block_degrades_to_empty_when_the_bundled_file_is_missing():
-    # A server-side install problem must cost the rules, not the scan: get_scan_command
-    # still has to hand back a working command.
+def test_get_scan_command_stays_small_enough_to_be_cheap():
+    # Guards the regression this endpoint exists to prevent: this response is read on
+    # every scan, so it must stay a command, not a document.
+    text = mcp_server.get_scan_command(_fake_ctx({"host": "example.test"}))
+    assert len(text) < 3000, f"scan command response grew to {len(text)} chars"
+
+
+def test_rules_endpoint_serves_the_file_byte_for_byte():
+    # What curl writes to .clinerules/scan-repo.md must be exactly the bundled file -
+    # this is the whole reason the model no longer copies it by hand.
+    resp = _http_client().get("/rules")
+    assert resp.status_code == 200
+    assert resp.text == mcp_server.CLINERULES_PATH.read_text(encoding="utf-8")
+
+
+def test_rules_endpoint_404s_instead_of_writing_an_empty_file():
+    # A missing bundled file must fail loudly. A 200 with empty text would have curl
+    # cheerfully truncate the repo's real rules file to nothing.
     with patch.object(mcp_server, "CLINERULES_PATH", Path("nonexistent") / "scan-repo.md"):
-        assert mcp_server._setup_rules_block() == ""
-        text = mcp_server.get_scan_command(_fake_ctx({"host": "example.test"}))
-    assert "http://example.test/scan" in text
+        resp = _http_client().get("/rules")
+    assert resp.status_code == 404
 
 
 def test_scan_http_endpoint_returns_the_finished_report():
