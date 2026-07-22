@@ -346,6 +346,28 @@ condensed `name==version` list (~99.5% smaller than the raw file - 618KB ->
 with a clear HTTP 413 before `model.generate()`, so an oversized prompt fails
 cleanly instead of crashing the server.
 
+### The report is the other thing that can overflow a context
+
+A lockfile is not the only unbounded input. The *report* grows with findings -
+about 500 tokens each - and a real 257-package `package-lock.json` produced 24
+of them: ~11,500 tokens of report, which overflowed a 32K model on its own
+**even though the scan had completely succeeded**. So the scan command splits
+the stream: `Tee-Object`/`tee` writes the full report to
+`reports/<date>-scan.md`, while `Select-String`/`grep` prints only the
+progress lines, the headline, the bucket counts and one line per finding with
+its severity. On a real report that is ~4,300 tokens trimmed to ~700 - an 84%
+cut with nothing lost, because the file on disk keeps every word. Failure
+lines (`ERROR:`, `No components...`) are explicitly kept by the filter: an
+earlier version dropped them, and a scan that died mid-pipeline printed
+progress and then just stopped, which reads exactly like success.
+
+If that still isn't enough headroom, `CONTEXT_FACTOR` turns on YaRN rope
+scaling in `serve_mistral.py` (Qwen2.5 supports 32K -> 131K). Raising
+`MAX_INPUT_TOKENS` alone cannot do it - the ceiling is the model's trained
+positional embeddings, not a policy knob - and the cost is KV cache: roughly
++13GB at `CONTEXT_FACTOR=2`, +25GB at `4`, on top of ~28GB of bf16 weights.
+`MAX_INPUT_TOKENS` derives from it by default so the two cannot drift apart.
+
 ### Using it against a different repo for the first time
 
 The MCP server is registered once in Cline's settings (globally, not per

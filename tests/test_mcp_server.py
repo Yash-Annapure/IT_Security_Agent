@@ -263,11 +263,106 @@ def test_get_scan_command_fetches_the_rules_with_curl_rather_than_inlining_them(
     assert "mkdir -p reports .clinerules" in text
 
 
+def test_display_filter_never_hides_a_failure():
+    # The filter trims the report down to what fits in context, and the first version
+    # of it swallowed the stream's "ERROR: ..." line - a scan that died mid-pipeline
+    # printed progress and then simply stopped, looking like success. Failure lines are
+    # the one thing that must always survive trimming.
+    import re
+
+    text = mcp_server.get_scan_command(_fake_ctx({"host": "example.test"}))
+    pattern = re.search(r"Select-String -Pattern\s+'([^']+)'", text).group(1)
+    compiled = re.compile(pattern.replace("\\d", "[0-9]"))
+    must_show = [
+        # failures - the category the first version of this filter swallowed
+        "ERROR: SQLite objects created in a thread can only be used in that same thread.",
+        "No components could be parsed - this is a valid but EMPTY npm lockfile",
+        "Could not parse lockfile: bad TOML",
+        # progress + verdict
+        "[  1.6s] Triaged: 0 escalated (CISA KEV), 6 confirmed, 3 need review",
+        "# Vulnerability scan result",
+        "**VULNERABILITIES FOUND: 6** (0 actively exploited, 6 confirmed)",
+        "- **confirmed**: 6",
+        # triaged findings
+        "### vite 7.2.7 (npm) - CVE-2026-39363",
+        "- **Severity:** HIGH (CVSS 7.5/10)",
+        # untriaged findings - a different report shape entirely, and the filter showed
+        # NONE of it at first: the model saw a headline and zero findings.
+        "# Vulnerability scan result (untriaged)",
+        "## flatted 3.3.3 (npm)",
+        "  - CVE-2026-33228 severity=CRITICAL cvss=9.8 vendor=webreflection",
+    ]
+    for line in must_show:
+        assert compiled.search(line), f"display filter would hide: {line!r}"
+    # Everything that changes how a finding should be ACTED ON must survive, not just
+    # the finding's identity. Trimming these was a real quality regression: a thin-cache
+    # scan would have relayed "NO VULNERABILITIES FOUND" with its coverage caveat cut
+    # off - the exact misreading this project documents as the most dangerous way it can
+    # be wrong - and name-collision notes would have vanished from review_queue items.
+    for line in [
+        "_Searched 369,464 cached CVEs (~100% of NVD's ~368,000) and 1,651 CISA known-exploited entries._",
+        "> **Coverage caveat:** the cache is incomplete, so this list is a lower bound",
+        "> **This is not a clean bill of health.** Only cached CVEs can be matched",
+        "_Not enough labeled data this run to train a confidence model_",
+        "**Fix:** upgrade `json5` to a version newer than 0.15.0",
+        "**What this means:** Rated 7.1/10 - serious, worth fixing soon",
+        "- **Weakness type:** [CWE-1321 Prototype Pollution](https://cwe.mitre.org/data/definitions/1321.html)",
+        "- **OSV.dev cross-check:** osv agrees",
+        "- **Note:** matched NVD vendor `babel`, but this package's registry page identifies",
+        "**Why the model hesitated (top SHAP factors):** `keyword_alignment` -1.40",
+    ]:
+        assert compiled.search(line), f"display filter would hide actionable content: {line!r}"
+    # The one thing held back is the quoted NVD description - long, and the only part of
+    # a finding that is already one click away via the record link printed above it.
+    for line in ["> Vite is a frontend tooling framework for JavaScript. From 6.0.0",
+                 "> JSON5 is an extension to the popular JSON file format"]:
+        assert not compiled.search(line), f"display filter should have dropped: {line!r}"
+
+
+def test_get_connection_is_per_thread():
+    # /scan runs every request on a fresh worker thread. A single cached connection
+    # worked exactly once per process - the second scan died with a cross-thread
+    # sqlite3 error, mid-pipeline, with no report. Verified against the real module
+    # state, not a mock, because the bug was in the caching itself.
+    import threading as _t
+
+    seen = {}
+
+    def grab(name):
+        seen[name] = mcp_server.get_connection()
+
+    with patch.object(mcp_server.nvd_cache, "get_connection", side_effect=lambda: object()):
+        a = _t.Thread(target=grab, args=("a",)); a.start(); a.join()
+        b = _t.Thread(target=grab, args=("b",)); b.start(); b.join()
+    assert seen["a"] is not seen["b"], "two threads shared one sqlite connection"
+
+
+def test_get_connection_is_reused_within_one_thread():
+    # Clears this thread's cached handle first and after, so the fake doesn't leak into
+    # any other test that opens the cache on the main thread.
+    for attr in ("conn",):
+        if hasattr(mcp_server._conns, attr):
+            delattr(mcp_server._conns, attr)
+    try:
+        with patch.object(mcp_server.nvd_cache, "get_connection",
+                          side_effect=lambda: object()) as mock_open:
+            first = mcp_server.get_connection()
+            second = mcp_server.get_connection()
+        assert first is second and mock_open.call_count == 1
+    finally:
+        if hasattr(mcp_server._conns, "conn"):
+            del mcp_server._conns.conn
+
+
 def test_get_scan_command_stays_small_enough_to_be_cheap():
     # Guards the regression this endpoint exists to prevent: this response is read on
-    # every scan, so it must stay a command, not a document.
+    # every scan, so it must stay a command, not a document. The ceiling is ~1K tokens
+    # because that is what the command *saves* many times over - the display filter it
+    # carries cuts a real report from ~4,300 tokens to ~700. Anything that pushes past
+    # this is prose, not mechanism, and prose belongs in .clinerules (fetched to disk,
+    # costing nothing) rather than in a response read on every single scan.
     text = mcp_server.get_scan_command(_fake_ctx({"host": "example.test"}))
-    assert len(text) < 3000, f"scan command response grew to {len(text)} chars"
+    assert len(text) < 4500, f"scan command response grew to {len(text)} chars"
 
 
 def test_rules_endpoint_serves_the_file_byte_for_byte():
@@ -416,17 +511,9 @@ def test_condense_http_endpoint_rejects_unparseable_content():
     assert "No components could be parsed" in resp.text
 
 
-def test_get_connection_caches_across_calls():
-    mcp_server._conn = None
-    try:
-        with patch.object(mcp_server.nvd_cache, "get_connection", return_value="a-connection") as mock_new:
-            first = mcp_server.get_connection()
-            second = mcp_server.get_connection()
-        assert first == "a-connection"
-        assert second is first
-        mock_new.assert_called_once()
-    finally:
-        mcp_server._conn = None
+# Caching behaviour now lives in test_get_connection_is_per_thread and
+# test_get_connection_is_reused_within_one_thread - the single `_conn` global they
+# used to cover was the cross-thread bug itself.
 
 
 def test_ensure_synced_skips_when_recent():

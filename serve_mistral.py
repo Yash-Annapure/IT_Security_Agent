@@ -74,7 +74,28 @@ PORT = int(os.environ.get("PORT", "8000"))
 # runs instead of finding out via a CUDA crash. Leave headroom below 32768 for
 # max_new_tokens plus the templating overhead apply_chat_template adds. If MODEL_ID is
 # ever changed to a model with a different real context length, update this to match.
-MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "28000"))
+NATIVE_CONTEXT = 32768
+
+# CONTEXT_FACTOR > 1 turns on YaRN rope scaling, which is the only way past the 32768
+# above - raising MAX_INPUT_TOKENS alone cannot do it, because the ceiling is the model's
+# trained positional embeddings, not a policy knob. Qwen2.5 supports YaRN to 131072
+# (factor 4). Off by default: it costs VRAM, and it slightly degrades quality on short
+# prompts, which is most of them.
+#
+# The cost is KV cache, and it is the reason this is a deployment decision rather than a
+# default. Qwen2.5-14B is ~28GB of bf16 weights, and its KV cache runs roughly 196KB per
+# token (48 layers x 8 KV heads x 128 dims x 2 tensors x 2 bytes), so:
+#     factor 1 -> 32k ctx, ~6GB KV   (fits a 40GB card comfortably)
+#     factor 2 -> 64k ctx, ~13GB KV  (~41GB total - needs 48GB+)
+#     factor 4 -> 128k ctx, ~25GB KV (~53GB total - needs 80GB)
+# Check free VRAM first: nvidia-smi --query-gpu=memory.free --format=csv
+EFFECTIVE_CONTEXT = int(NATIVE_CONTEXT * float(os.environ.get("CONTEXT_FACTOR", "1")))
+
+# Derived from the context so the two cannot drift apart - a MAX_INPUT_TOKENS above the
+# real window is exactly the crash this guard exists to prevent. The reserve is for
+# max_new_tokens plus apply_chat_template's overhead; at factor 1 this is 28000, the
+# value this served before the setting existed.
+MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", str(EFFECTIVE_CONTEXT - 4768)))
 TOOL_CALL_START = "<tool_call>"
 TOOL_CALL_END = "</tool_call>"
 
@@ -107,6 +128,11 @@ def startup_banner() -> str:
         "  API Key: any non-empty placeholder",
         f"  Model ID: {MODEL_ID}",
         "",
+        f"Context: {EFFECTIVE_CONTEXT:,} tokens"
+        + ("" if EFFECTIVE_CONTEXT == NATIVE_CONTEXT
+           else f" (YaRN x{EFFECTIVE_CONTEXT / NATIVE_CONTEXT:g} over {NATIVE_CONTEXT:,})")
+        + f", prompts capped at {MAX_INPUT_TOKENS:,}.",
+        "",
         "No built-in auth - only expose this on a private/trusted network.",
         "=" * 70,
     ]
@@ -119,12 +145,30 @@ if not torch.cuda.is_available():
     print("WARNING: no CUDA GPU detected - running a 7B model on CPU will be very slow.", flush=True)
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+_extra = {}
+if EFFECTIVE_CONTEXT > NATIVE_CONTEXT:
+    # Static YaRN: applied to every forward pass, including short ones. Transformers
+    # renamed this key ("type" -> "rope_type") around 4.45; both are sent because the
+    # config validator accepts the pair and older builds ignore the newer name.
+    _extra = {
+        "rope_scaling": {
+            "type": "yarn",
+            "rope_type": "yarn",
+            "factor": EFFECTIVE_CONTEXT / NATIVE_CONTEXT,
+            "original_max_position_embeddings": NATIVE_CONTEXT,
+        },
+        "max_position_embeddings": EFFECTIVE_CONTEXT,
+    }
+    print(f"YaRN rope scaling ON: {NATIVE_CONTEXT} -> {EFFECTIVE_CONTEXT} tokens "
+          f"(factor {EFFECTIVE_CONTEXT / NATIVE_CONTEXT:g}). Expect a larger KV cache; "
+          f"if this OOMs, lower CONTEXT_FACTOR.", flush=True)
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     torch_dtype=dtype,
     device_map="auto",
     attn_implementation="sdpa",
     low_cpu_mem_usage=True,
+    **_extra,
 )
 model.eval()
 print("Model loaded.", flush=True)
@@ -293,13 +337,18 @@ def run_generate(messages: list[dict], tools: list[dict] | None, max_new_tokens:
             detail=(
                 f"Prompt is {input_len} tokens, over this server's {MAX_INPUT_TOKENS}-token "
                 f"limit (kept safely under the model's real 32768-token context, leaving "
-                f"room to actually generate a response). This almost always means a raw "
-                f"lockfile was read into the conversation. Start a NEW task - this one "
-                f"cannot recover, because the oversized content is already in its history. "
-                f"In the new task, never open a lockfile: run the command get_scan_command "
-                f"returns, which streams the file from disk to the server so it never "
-                f"enters context. If the lockfile is not at the repo root, find its path "
-                f"with a file listing (not by reading it) and put that path after the @."
+                f"room to actually generate a response). Either way, start a NEW task - "
+                f"this one cannot recover, because the oversized content is already in its "
+                f"history. Two things cause this, and they need different fixes:\n"
+                f"  (1) A raw lockfile was read into the conversation. Never open one: run "
+                f"the command get_scan_command returns, which streams the file from disk to "
+                f"the server so it never enters context. If the lockfile is not at the repo "
+                f"root, the command finds it - do not go looking by hand.\n"
+                f"  (2) The scan SUCCEEDED and its report is simply large - report size "
+                f"grows with the number of findings, roughly 500 tokens each. The report is "
+                f"already saved to reports/<date>-scan.md, so nothing is lost. In the new "
+                f"task, relay the summary and the finding list from that file rather than "
+                f"the whole report, and point the user at the file for full detail."
             ),
         )
 

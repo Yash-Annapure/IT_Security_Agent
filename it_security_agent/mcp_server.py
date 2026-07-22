@@ -25,6 +25,7 @@ import json
 import os
 import re
 import socket
+import threading
 import time
 from pathlib import Path
 from typing import Annotated
@@ -126,15 +127,29 @@ mcp = FastMCP(
     ),
 )
 
-_conn = None
+_conns = threading.local()
 _last_synced = 0.0
 
 
 def get_connection():
-    global _conn
-    if _conn is None:
-        _conn = nvd_cache.get_connection()
-    return _conn
+    """One SQLite connection per thread, created on first use in that thread.
+
+    Per-thread, not a single shared one, because sqlite3 connections are bound to the
+    thread that opened them (check_same_thread) and /scan runs every request on a fresh
+    worker thread. A single cached connection therefore worked exactly once per server
+    process: the first scan opened it, and the second - on a different thread - died
+    with "SQLite objects created in a thread can only be used in that same thread",
+    aborting mid-pipeline with no report. The startup sync thread already opened its own
+    connection for this reason; this generalises that to every thread.
+
+    Connections are never closed, which is deliberate: threads here are short-lived
+    request workers, and a closed-over cache handle costs a few KB against a cache
+    that is read on every scan.
+    """
+    conn = getattr(_conns, "conn", None)
+    if conn is None:
+        conn = _conns.conn = nvd_cache.get_connection()
+    return conn
 
 
 # NVD's published catalog size, for reporting how much of it this cache actually holds.
@@ -709,35 +724,54 @@ def get_scan_command(ctx: Context) -> str:
         "if (-not $lock) { 'No lockfile found under ' + $PWD } else { "
         "'Scanning ' + $lock.FullName; "
         f"curl.exe -sN -X POST {base}/scan --data-binary \"@$($lock.FullName)\" | "
-        "Tee-Object -Variable report; "
-        f"[IO.File]::WriteAllLines(\"$PWD\\{win_report}\", $report) }}\n\n"
+        "Tee-Object -Variable report | "
+        "Select-String -Pattern "
+        "'^\\[|^ERROR|^No components|^Could not|^#+ |^_Searched|^_Not enough|^> \\*\\*|"
+        "^\\*\\*(VULNERABILITIES|NO |Fix:|What this means|Why the model|What drove)|"
+        "^- \\*\\*(Severity|Note:|OSV|Weakness)|^- .*: \\d+$|^ +- CVE-' | "
+        "ForEach-Object { $_.Line }; "
+        f"[IO.File]::WriteAllLines(\"$PWD\\{win_report}\", $report); "
+        f"'--- full report: {report_path} ---' }}\n\n"
         "  bash / zsh (Linux/macOS):\n    mkdir -p reports .clinerules && "
         f"curl -s {base}/rules -o .clinerules/scan-repo.md && "
         f"{sh_find} && echo \"Scanning $lock\" && "
-        f"curl -sN -X POST {base}/scan --data-binary @\"$lock\" | tee {report_path}\n\n"
+        f"curl -sN -X POST {base}/scan --data-binary @\"$lock\" | tee {report_path} | "
+        "grep -E --line-buffered "
+        "'^(\\[|ERROR|No components|Could not|#+ |_Searched|_Not enough|> \\*\\*|"
+        "\\*\\*(VULNERABILITIES|NO |Fix:|What this means|Why the model|What drove)|"
+        "- \\*\\*(Severity|Note:|OSV|Weakness)|- .*: [0-9]+$| +- CVE-)' && "
+        f"echo \"--- full report: {report_path} ---\"\n\n"
         "It searches the whole tree (skipping node_modules/.venv/.git) and takes the "
         "LARGEST lockfile, then prints which one it picked. Largest, because a repo can "
         "hold an empty stub - `npm install` writes one when there is no package.json - "
         "and a stub must never beat the project's real lockfile in a subdirectory. If it "
         "prints 'No lockfile found', tell the user; do not go looking by hand.\n\n"
         "DO NOT redirect this with `>`, and do not simplify it. Each part earns its "
-        "place: `Tee-Object -Variable` shows every pipeline stage on screen as it happens "
-        "while capturing the text, and `[IO.File]::WriteAllLines` writes "
-        f"{report_path} as plain UTF-8. A `>` redirect hides all the progress "
-        "AND writes UTF-16 on some PowerShell hosts, which doubles the file size and "
-        "makes git treat the report as binary. `-N` stops curl buffering, so stages "
-        "appear as they happen rather than all at once at the end.\n\n"
+        "place: `Tee-Object -Variable` captures the FULL report while letting it stream, "
+        "`Select-String` prints everything except the quoted NVD description paragraphs, "
+        f"and `[IO.File]::WriteAllLines` writes the full text to {report_path} as plain "
+        "UTF-8. That split is deliberate: the complete report runs ~500 tokens per "
+        "finding and a real npm project produced 24 of them (~11,500 tokens), which "
+        "overflowed a 32K model's context on its own even though the scan had fully "
+        "succeeded. Only the NVD prose is held back, and only from your screen - it is "
+        "the one part already available elsewhere (every finding links to its NVD "
+        "record), and the file on disk keeps every word. Coverage caveats, fixes, CWEs, "
+        "OSV agreement, name-collision notes and SHAP factors all still print, because "
+        "each of them changes how a finding should be acted on. A `>` redirect hides the "
+        "progress AND writes UTF-16 on some PowerShell hosts, which doubles the file "
+        "size and makes git treat the report as binary. `-N` stops curl buffering, so "
+        "stages appear as they happen.\n\n"
         "The first curl writes this repo's rules to .clinerules/scan-repo.md - that is "
         "the whole of the repo setup, and the file must never be retyped by hand. Do not "
         "read it back.\n\n"
         "You will see stages stream in - SBOM generation, cache coverage, model "
-        "training, SHAP, triage - then the finished report; usually seconds, up "
-        "to ~2 minutes on the first run after a server restart. Wait for it to finish, "
-        "don't retry or cancel. The file is already saved by the time it ends, so do "
-        "not re-save it; just relay the FULL output to the user - the report ends with "
-        "a '## Pipeline' section recording exactly which stages ran, which is part of "
-        "the report, not noise to strip. If the user explicitly asked for an SBOM, "
-        "append ?include_sbom=true to the URL."
+        "training, SHAP, triage - then the headline and one line per finding; usually "
+        "seconds, up to ~2 minutes on the first run after a server restart. Wait for it "
+        "to finish, don't retry or cancel. Relay what it printed to the user verbatim, "
+        "and tell them the full detail for every finding - descriptions, CWEs, SHAP "
+        f"factors, fixes - is in {report_path}. Do not open that file to quote it back; "
+        "it is for the human, and reading it puts you right back over the context limit. "
+        "If the user explicitly asked for an SBOM, append ?include_sbom=true to the URL."
     )
 
 
