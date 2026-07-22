@@ -230,6 +230,20 @@ Four bugs found by checking rather than trusting:
    implementation bug but the ceiling of a seven-proxy-feature model, and it is what the vendor
    gate was added to address.
 
+## Regulatory analysis (EU-focused)
+
+Week 1 did this same analysis before any of the scanning code existed, against a planned architecture. Below is the same kind of table, for the system as it actually stands now.
+
+| Regulation | Relevance to this project |
+|---|---|
+| **Cyber Resilience Act (CRA)** | Manufacturers of products with digital elements must maintain an SBOM and handle vulnerabilities across the product lifecycle, including reporting actively exploited flaws to ENISA/CSIRTs (24h early warning, 72h follow-up). This project produces exactly that artifact, and does not depend on someone else's SBOM being trustworthy: `generate_sbom.py` rebuilds a real CycloneDX document from the project's own lockfile on every scan, so a stale or incomplete supplied SBOM can never quietly become the source of truth. The four-bucket triage (escalated, confirmed, review_queue, rejected) is the vulnerability-handling record that CRA compliance work would consume, with CISA KEV hits, actively exploited vulnerabilities, surfaced first. |
+| **NIS2 Directive** | Imposes supply-chain security and incident-reporting obligations on essential and important entities. A working vulnerability scanner is a concrete control supporting that requirement, and the vendor gate (which caught four real name-collision false positives on this project's own dependencies during testing) plus the OSV.dev cross-check both cut down the false-positive load on whatever incident-response process NIS2 requires, so effort isn't spent chasing name coincidences instead of real issues. |
+| **GDPR** | Still mostly indirect: the agent processes software component metadata (package names, versions, vendor strings), not personal data. One specific change is worth noting though: dependency-file content, which could include internal package or host naming, is deliberately kept out of the conversational model's context entirely, and that model now runs self-hosted, on infrastructure the user controls, rather than a third-party hosted API. That is a stronger data-minimization and data-residency posture than the project needed to consider before this architecture existed. |
+| **EU AI Act** | This project ships exactly one AI system: the confidence classifier (logistic regression or random forest) that scores whether a vendor match is real. It almost certainly falls under minimal or limited risk, not an Annex III high-risk use case, but the transparency and human-oversight expectations that apply to any AI system are built into the architecture, not added afterward: every uncertain finding gets a SHAP explanation and a mandatory human review step (`review_queue`) rather than a silent pass or fail. The conversational, generative layer, Cline plus a self-hosted Mistral model, is a separate system this project calls into, not one it trains or ships, so this project acts as a deployer of that model, not its provider. |
+| **NVD Terms of Use** | Not legislation, but still a binding practical constraint on API rate limits and attribution. `nvd_client.py` and `nvd_cache.py` implement that directly: a full NVD sync now runs once, locally, rather than as a live call per package on every scan. |
+
+**Takeaway:** the finished system holds up against the same regulatory picture Week 1 sketched before any code existed, and in two places, CRA's SBOM obligation and the AI Act's transparency and oversight expectations, it satisfies the requirement more concretely than the original plan called for. That wasn't the explicit goal going in. The same design choices that solved the actual engineering problems, an auditable local cache, a narrow classifier kept separate from the conversational layer, mandatory human review for anything uncertain, turned out to serve the regulatory picture too.
+
 ## Current state
 
 - **223 tests passing, ~94% coverage.** Every external call is mocked, so the suite never touches
