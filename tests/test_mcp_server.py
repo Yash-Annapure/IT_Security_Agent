@@ -232,7 +232,7 @@ def test_get_scan_command_tees_instead_of_redirecting():
     assert "[IO.File]::WriteAllLines" in text          # ...saved as plain UTF-8, not UTF-16
     assert "| tee reports/" in text                    # bash/zsh
     assert "-sN" in text                               # unbuffered: stages appear live
-    assert "DO NOT redirect this with `>`" in text
+    assert "DO NOT redirect it with `>`" in text
 
 
 def test_get_scan_command_falls_back_to_http_without_proto_header():
@@ -261,6 +261,62 @@ def test_get_scan_command_fetches_the_rules_with_curl_rather_than_inlining_them(
     assert text.index("/rules") < text.index("/scan")
     assert "New-Item -ItemType Directory -Force reports, .clinerules" in text
     assert "mkdir -p reports .clinerules" in text
+
+
+def _f(cve, sev, score, kev=False, name="pkg"):
+    return Finding(component=Component(name=name, version="1.0", ecosystem="npm", source="t"),
+                   cve=cve, severity=sev, cvss_score=score, kev_hit=kev)
+
+
+def test_summary_block_is_flat_in_the_number_of_findings():
+    # The whole point: the caller's reply must not grow with what the scan found. A
+    # model asked to retype 23 findings hit its 1024-token output cap partway through
+    # the tenth and the reply was cut off mid-sentence.
+    small = ScanResult(confirmed=[_f("CVE-1", "HIGH", 7.5)])
+    large = ScanResult(confirmed=[_f(f"CVE-{i}", "HIGH", 7.5) for i in range(200)])
+    meta = {"cache": FULL_CACHE}
+    a = "\n".join(mcp_server._summary_block(small, meta))
+    b = "\n".join(mcp_server._summary_block(large, meta))
+    assert len(b) < len(a) + 120, "summary grew with finding count"
+    assert "...and 197 more." in b
+
+
+def test_summary_block_never_drops_an_actively_exploited_finding():
+    # Escalated findings are shown in full however many there are. A KEV entry is
+    # exploited in the wild right now, so "...and N more" must never be what hides it -
+    # even when its CVSS is lower than the confirmed findings above it.
+    result = ScanResult(
+        escalated=[_f("CVE-KEV-1", "MEDIUM", 6.5, kev=True, name="exploited"),
+                   _f("CVE-KEV-2", "LOW", 3.1, kev=True, name="alsoexploited")],
+        confirmed=[_f(f"CVE-C{i}", "CRITICAL", 9.8, name=f"c{i}") for i in range(10)])
+    block = "\n".join(mcp_server._summary_block(result, {"cache": FULL_CACHE}))
+    assert "CVE-KEV-1" in block and "CVE-KEV-2" in block
+    assert block.index("CVE-KEV-1") < block.index("CVE-C0"), "KEV must sort above CVSS"
+    assert "...and 7 more." in block
+
+
+def test_summary_block_carries_the_thin_cache_warning_when_nothing_was_found():
+    # The report body says this too, but the caller now relays only this block - so an
+    # empty result on a thin cache has to carry its own warning or the guardrail is lost
+    # exactly where it matters most.
+    block = "\n".join(mcp_server._summary_block(ScanResult(), {"cache": THIN_CACHE}))
+    assert "NOT a clean bill of health" in block
+    # ...and phrased the other way when findings exist, matching the report body.
+    found = ScanResult(confirmed=[_f("CVE-1", "HIGH", 7.5)])
+    assert "lower bound" in "\n".join(mcp_server._summary_block(found, {"cache": THIN_CACHE}))
+
+
+def test_summary_block_survives_the_display_filter():
+    import re
+
+    text = mcp_server.get_scan_command(_fake_ctx({"host": "example.test"}))
+    compiled = re.compile(re.search(r"Select-String -Pattern '([^']+)'", text).group(1)
+                          .replace("\\d", "[0-9]"))
+    result = ScanResult(escalated=[_f("CVE-KEV-1", "HIGH", 8.1, kev=True, name="exploited")],
+                        confirmed=[_f("CVE-2", "LOW", 2.0)], review_queue=[_f("CVE-3", "LOW", 1.0)])
+    for line in mcp_server._summary_block(result, {"cache": THIN_CACHE}):
+        if line.strip():
+            assert compiled.search(line), f"filter would hide summary line: {line!r}"
 
 
 def test_display_filter_never_hides_a_failure():

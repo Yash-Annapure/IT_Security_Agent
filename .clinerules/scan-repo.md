@@ -27,16 +27,26 @@ do them in order, every time, nothing more:
    first `curl` refreshes this rules file from the server - that is the
    entire repo setup, already done by running the command, and you must
    never write this file yourself.
-3. **Relay what it printed, verbatim, and point at the file.** What you
-   see is already the trimmed view: progress, the headline, the bucket
-   counts, and every finding with its severity and CVSS. Pass that on as
-   printed, then tell the user the full detail for each finding -
-   descriptions, CWEs, SHAP factors, fixes - is in
-   `reports/<YYYY-MM-DD>-scan.md`. Do not re-save it, and **do not open
-   it to quote more**: the full report runs ~500 tokens per finding, and
-   reading it back is what puts you over the context limit on a repo with
-   real findings. The trimmed view is the deliverable; the file is for
-   the human. Done.
+3. **Copy the Summary block, and stop.** The output contains a block
+   headed `## Summary (relay this block, nothing more)`. Reproduce that
+   block verbatim as your reply, add nothing to it, and you are done. It
+   already carries the counts, how much of NVD was searched, the worst
+   few findings, every actively-exploited one, and how many remain.
+
+   **Do not retype the individual findings.** A model asked to do that
+   started reformatting all 23, hit its output limit partway through the
+   tenth, and its reply was cut off mid-sentence - having already dropped
+   every OSV cross-check line and the entire review-queue finding, name
+   collision and all. The Summary block is ~90 tokens whatever the repo
+   contains, so it always arrives whole; a hand-written list grows with
+   the findings and eventually will not.
+
+   The user can already see the full printed output above your reply, and
+   every detail - descriptions, CWEs, SHAP factors, fixes - is in
+   `reports/<YYYY-MM-DD>-scan.md`. Do not re-save that file and **do not
+   open it to quote more from it**: it runs ~500 tokens per finding, and
+   reading it back is what puts you over the context limit. Point the
+   user at it instead. Done.
 
 If you are in Cline's Plan mode you cannot use tools - say so and ask the
 user to switch to Act mode instead of re-describing the plan.
@@ -92,19 +102,28 @@ user to switch to Act mode instead of re-describing the plan.
 
 ## Reporting rules
 
-- Save and relay the command's output **verbatim** - never summarize,
-  truncate, or replace any part of it with placeholders like
-  `{ ... (content) ... }` or `[results here]`. A report containing
-  placeholders instead of real output is worse than no report.
+- **Copy, never compose.** The Summary block is written by the scanner
+  from the same data as the report, so copying it cannot disagree with
+  the findings. Anything you write yourself can - and did: a hand-made
+  summary dropped every OSV line and a whole review-queue finding before
+  it ran out of output and stopped mid-sentence.
+- Relay the Summary block **verbatim** - never paraphrase it, reorder it,
+  or replace part of it with placeholders like `{ ... (content) ... }` or
+  `[results here]`. A block containing placeholders is worse than none.
 - Never state a CVE ID, severity, or CVSS score that isn't literally in
   the output. "No vulnerabilities found" may only be said if the output
-  literally says nothing was found - never as a guess or default.
-- If the output says "untriaged" / "not enough labeled data," tell the
-  user those are unscored raw matches, not confirmed vulnerabilities.
-- Output buckets, relayed faithfully: **escalated** = actively exploited
-  (CISA KEV), lead with these; **confirmed** = real matches;
-  **review_queue** = needs a human, pass along the "top factors";
-  rejected = name collisions, only mention if asked.
+  literally says so - never as a guess or default. If the summary carries
+  a `WARNING: cache is incomplete` line, keep it: without it an empty
+  result reads as "you're clean" when it means "we couldn't look."
+- If the output says "untriaged" / "not enough labeled data," those are
+  unscored raw matches, not confirmed vulnerabilities - the Summary block
+  says so, so keep that wording rather than smoothing it over.
+- **If the user asks about a specific finding**, quote it from the
+  printed output already above you - `escalated` = actively exploited
+  (CISA KEV) and always comes first, `confirmed` = real matches,
+  `review_queue` = needs a human (pass along its "top factors" and any
+  name-collision Note), `rejected` = collisions, mention only if asked.
+  Answer from what is on screen; do not open the report file.
 
 ## SBOMs
 

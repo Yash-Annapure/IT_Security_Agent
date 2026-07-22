@@ -416,6 +416,116 @@ def _verdict(result, meta: dict) -> list:
     return ["", headline] + _coverage_caveat(meta, bool(actionable))
 
 
+SUMMARY_ROWS = 3  # plus every escalated finding, which is never displaced
+REPORT_FILENAME = "reports/<date>-scan.md"
+
+# What the scan command lets through to the terminal. The full report is always written
+# to disk; this decides what the *model* sees, and therefore what it can pass on.
+#
+# The rule is: keep anything that changes how a finding should be acted on, drop only
+# what is redundant. Trimming too hard is not a cosmetic mistake - an earlier version cut
+# the coverage caveat, which would have let a thin-cache scan report "NO VULNERABILITIES
+# FOUND" with the warning removed, and cut the ERROR line, which made a scan that died
+# mid-pipeline look like one that succeeded.
+#
+# Groups, in order: the summary block the caller relays (fenced, its own prose lines and
+# indented severity rows); pipeline progress and failures; headings; coverage statements
+# and caveats; per-finding explanation, fix, severity, CWE, OSV agreement, collision note
+# and SHAP factors; and the untriaged report's raw match lines. What is left out is the
+# quoted NVD description - the one part already one click away via each finding's link.
+_DISPLAY_GROUPS = [
+    r"^```", r"^\d+ (to fix|raw name)", r"^No (vulnerabilities|confirmed)", r"^Searched ",
+    r"^WARNING", r"^Full detail", r"^ +(KEV )?(CRITICAL|HIGH|MEDIUM|LOW|UNKNOWN) ",
+    r"^ +\.\.\.and ",
+    r"^\[", r"^ERROR", r"^No components", r"^Could not", r"^#+ ",
+    r"^_Searched", r"^_Not enough", r"^> \*\*",
+    r"^\*\*(VULNERABILITIES|NO |Fix:|What this means|Why the model|What drove)",
+    r"^- \*\*(Severity|Note:|OSV|Weakness)", r"^- .*: \d+$", r"^ +- CVE-",
+]
+_DISPLAY_PATTERN = "|".join(_DISPLAY_GROUPS)
+# grep -E has no \d, and anchors each alternative itself rather than sharing one ^.
+_DISPLAY_PATTERN_POSIX = "|".join(g.replace(r"\d", "[0-9]") for g in _DISPLAY_GROUPS)
+
+
+def _summary_rows(findings, limit) -> list:
+    """The worst `limit` findings as fixed-width rows, escalated ones first.
+
+    Sorted by exploited-in-the-wild before CVSS on purpose: a KEV entry at 6.5 matters
+    more than a theoretical 9.8, so severity alone would bury the one finding that is
+    actually being used against people right now.
+    """
+    def rank(f):
+        return (0 if f.kev_hit else 1, -(f.cvss_score or 0))
+
+    rows = []
+    for f in sorted(findings, key=rank)[:limit]:
+        score = f"{f.cvss_score:.1f}" if f.cvss_score is not None else " - "
+        flag = "KEV " if f.kev_hit else ""
+        rows.append(f"  {flag}{f.severity:<8} {score:>4}  "
+                    f"{f.component.name} {f.component.version} ({f.component.ecosystem})"
+                    f"  {f.cve}")
+    return rows
+
+
+def _summary_block(result, meta: dict) -> list:
+    """A short, ready-to-relay summary the caller copies instead of composing one.
+
+    This exists because of what happens when a model is asked to summarise the report
+    itself. Given 23 confirmed findings it began retyping all of them, hit the server's
+    1024-token output cap partway through the tenth, and the reply simply stopped. The
+    part it had written was already lossy - it had dropped every OSV cross-check line
+    and the entire review-queue finding, name-collision note and all.
+
+    Both failures come from asking the model to *compose*. So the server composes, and
+    the model's job shrinks to copying ~90 tokens - short enough that truncation cannot
+    happen and there is nothing to paraphrase. The counts here are computed from the
+    same ScanResult that builds the report below, so the summary cannot contradict it.
+
+    Length is O(1) in the number of findings, which is the whole point: this is the one
+    part of the pipeline whose size must not grow with what the scan discovers.
+    """
+    escalated, confirmed, review = result.escalated, result.confirmed, result.review_queue
+    actionable = escalated + confirmed
+    lines = ["", "## Summary (relay this block, nothing more)", "```"]
+
+    needs = "needs" if len(review) == 1 else "need"
+    if actionable:
+        lines.append(f"{len(actionable)} to fix ({len(escalated)} actively exploited, "
+                     f"{len(confirmed)} confirmed), {len(review)} {needs} human review.")
+    elif review:
+        lines.append(f"No confirmed vulnerabilities, but {len(review)} {needs} human review.")
+    else:
+        lines.append("No vulnerabilities found in the scanned components.")
+
+    cache = meta.get("cache")
+    if cache:
+        lines.append(f"Searched {cache['cves']:,} cached CVEs (~{cache['fraction']:.0%} of NVD) "
+                     f"+ {cache['kev']:,} known-exploited.")
+        # The empty-result case is where a thin cache is most dangerous and least
+        # visible, so the warning travels inside the block the caller actually relays -
+        # not only in the report body, which by design they no longer reproduce. Same
+        # two phrasings the report body uses: with findings a thin cache means the list
+        # is short, with none it means the silence is meaningless.
+        if cache["thin"]:
+            lines.append("WARNING: cache is incomplete - this list is a lower bound."
+                         if (actionable or review) else
+                         "WARNING: cache is incomplete - this is NOT a clean bill of health.")
+
+    # Escalated findings are all shown, however many: "and N more" must never be the
+    # thing that hides an actively-exploited vulnerability.
+    shown = _summary_rows(escalated, len(escalated)) + \
+        _summary_rows(confirmed, SUMMARY_ROWS)
+    if shown:
+        lines += [""] + shown
+        remaining = len(actionable) - len(shown) + len(review)
+        if remaining > 0:
+            lines.append(f"  ...and {remaining} more.")
+
+    lines += [f"Full detail for every finding - fixes, CWEs, NVD records - is in "
+              f"{REPORT_FILENAME}.", "```"]
+    return lines
+
+
 def _flagging_policy(meta: dict) -> list:
     """How each match got its bucket. The buckets are policy, not model output - saying
     so stops "confirmed" reading as certainty or "rejected" as absence."""
@@ -444,6 +554,7 @@ def format_summary(result, meta: dict) -> str:
         lines.append(f"_Scanned {meta['scanned']} of {meta['total']} components "
                       f"(capped by max_components={meta['max_components']})._")
     lines += _verdict(result, meta)
+    lines += _summary_block(result, meta)
     lines += [
         "",
         f"- **escalated** (actively exploited - CISA KEV): {len(result.escalated)}",
@@ -583,6 +694,33 @@ def format_raw_matches(found: list, meta: dict) -> str:
     # The untriaged fallback can report an empty result for exactly the same reason the
     # triaged path can - an incomplete cache - so it carries the same caveat.
     lines += _coverage_caveat(meta, bool(found))
+    # Same block as the triaged path, for the same reason - and it has to say "unscored"
+    # loudly, because this is the one report whose findings carry no confidence at all.
+    total = sum(len(matches) for _, matches in found)
+    worst = sorted(
+        ((m, component) for component, matches in found for m in matches),
+        key=lambda pair: -(pair[0].get("cvss_score") or 0),
+    )[:SUMMARY_ROWS]
+    block = ["", "## Summary (relay this block, nothing more)", "```",
+             f"{total} raw name+version match{'es' if total != 1 else ''} - UNSCORED, "
+             f"not confirmed vulnerabilities. Every one needs a human."]
+    cache = meta.get("cache")
+    if cache:
+        block.append(f"Searched {cache['cves']:,} cached CVEs (~{cache['fraction']:.0%} of NVD) "
+                     f"+ {cache['kev']:,} known-exploited.")
+        if cache["thin"]:
+            block.append("WARNING: cache is incomplete - this list is a lower bound."
+                         if found else
+                         "WARNING: cache is incomplete - this is NOT a clean bill of health.")
+    for m, component in worst:
+        score = f"{m['cvss_score']:.1f}" if m.get("cvss_score") is not None else " - "
+        block.append(f"  {m['severity']:<8} {score:>4}  {component.name} "
+                     f"{component.version} ({component.ecosystem})  {m['cve']}")
+    if total > len(worst):
+        block.append(f"  ...and {total - len(worst)} more.")
+    block += [f"Full detail is in {REPORT_FILENAME}.", "```"]
+    lines += block
+
     if not found:
         lines.append("\nNo name+version matches found in the scanned components.")
         return "\n".join(lines)
@@ -725,10 +863,7 @@ def get_scan_command(ctx: Context) -> str:
         "'Scanning ' + $lock.FullName; "
         f"curl.exe -sN -X POST {base}/scan --data-binary \"@$($lock.FullName)\" | "
         "Tee-Object -Variable report | "
-        "Select-String -Pattern "
-        "'^\\[|^ERROR|^No components|^Could not|^#+ |^_Searched|^_Not enough|^> \\*\\*|"
-        "^\\*\\*(VULNERABILITIES|NO |Fix:|What this means|Why the model|What drove)|"
-        "^- \\*\\*(Severity|Note:|OSV|Weakness)|^- .*: \\d+$|^ +- CVE-' | "
+        f"Select-String -Pattern '{_DISPLAY_PATTERN}' | "
         "ForEach-Object { $_.Line }; "
         f"[IO.File]::WriteAllLines(\"$PWD\\{win_report}\", $report); "
         f"'--- full report: {report_path} ---' }}\n\n"
@@ -736,41 +871,28 @@ def get_scan_command(ctx: Context) -> str:
         f"curl -s {base}/rules -o .clinerules/scan-repo.md && "
         f"{sh_find} && echo \"Scanning $lock\" && "
         f"curl -sN -X POST {base}/scan --data-binary @\"$lock\" | tee {report_path} | "
-        "grep -E --line-buffered "
-        "'^(\\[|ERROR|No components|Could not|#+ |_Searched|_Not enough|> \\*\\*|"
-        "\\*\\*(VULNERABILITIES|NO |Fix:|What this means|Why the model|What drove)|"
-        "- \\*\\*(Severity|Note:|OSV|Weakness)|- .*: [0-9]+$| +- CVE-)' && "
+        f"grep -E --line-buffered '{_DISPLAY_PATTERN_POSIX}' && "
         f"echo \"--- full report: {report_path} ---\"\n\n"
         "It searches the whole tree (skipping node_modules/.venv/.git) and takes the "
         "LARGEST lockfile, then prints which one it picked. Largest, because a repo can "
         "hold an empty stub - `npm install` writes one when there is no package.json - "
         "and a stub must never beat the project's real lockfile in a subdirectory. If it "
         "prints 'No lockfile found', tell the user; do not go looking by hand.\n\n"
-        "DO NOT redirect this with `>`, and do not simplify it. Each part earns its "
-        "place: `Tee-Object -Variable` captures the FULL report while letting it stream, "
-        "`Select-String` prints everything except the quoted NVD description paragraphs, "
-        f"and `[IO.File]::WriteAllLines` writes the full text to {report_path} as plain "
-        "UTF-8. That split is deliberate: the complete report runs ~500 tokens per "
-        "finding and a real npm project produced 24 of them (~11,500 tokens), which "
-        "overflowed a 32K model's context on its own even though the scan had fully "
-        "succeeded. Only the NVD prose is held back, and only from your screen - it is "
-        "the one part already available elsewhere (every finding links to its NVD "
-        "record), and the file on disk keeps every word. Coverage caveats, fixes, CWEs, "
-        "OSV agreement, name-collision notes and SHAP factors all still print, because "
-        "each of them changes how a finding should be acted on. A `>` redirect hides the "
-        "progress AND writes UTF-16 on some PowerShell hosts, which doubles the file "
-        "size and makes git treat the report as binary. `-N` stops curl buffering, so "
-        "stages appear as they happen.\n\n"
+        "DO NOT redirect it with `>` and do not simplify it. `Tee-Object`/`tee` captures "
+        f"the FULL report to {report_path}; the filter decides only what reaches your "
+        "screen. A `>` redirect hides the progress and writes UTF-16 on some PowerShell "
+        "hosts. `-N` stops curl buffering so stages appear as they happen.\n\n"
         "The first curl writes this repo's rules to .clinerules/scan-repo.md - that is "
         "the whole of the repo setup, and the file must never be retyped by hand. Do not "
         "read it back.\n\n"
-        "You will see stages stream in - SBOM generation, cache coverage, model "
-        "training, SHAP, triage - then the headline and one line per finding; usually "
-        "seconds, up to ~2 minutes on the first run after a server restart. Wait for it "
-        "to finish, don't retry or cancel. Relay what it printed to the user verbatim, "
-        "and tell them the full detail for every finding - descriptions, CWEs, SHAP "
-        f"factors, fixes - is in {report_path}. Do not open that file to quote it back; "
-        "it is for the human, and reading it puts you right back over the context limit. "
+        "Stages stream in, then the report; seconds usually, up to ~2 minutes on the "
+        "first run after a server restart. Wait for it, don't retry or cancel.\n\n"
+        "TO REPORT BACK: copy the '## Summary (relay this block, nothing more)' block "
+        "verbatim and stop there. Do NOT retype the individual findings - a model asked "
+        "to do that hit its output limit partway through the tenth of 23 and the reply "
+        "was cut off mid-sentence, having already dropped the OSV lines and the entire "
+        f"review-queue finding. The summary is ~90 tokens and always complete; {report_path} "
+        "holds every detail for the human. Do not open that file to quote more from it. "
         "If the user explicitly asked for an SBOM, append ?include_sbom=true to the URL."
     )
 
