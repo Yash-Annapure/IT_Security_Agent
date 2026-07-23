@@ -12,3 +12,4 @@ nvd_cache.db-shm
 *.joblib
 reports/
 .coverage
+
