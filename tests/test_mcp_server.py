@@ -458,6 +458,56 @@ def test_scan_http_endpoint_includes_sbom_only_when_requested():
     assert "Generated SBOM" in resp.text
 
 
+def test_sbom_endpoint_returns_the_generated_cyclonedx_document():
+    # The SBOM travels disk -> server -> disk, exactly like the rules file, so a
+    # document with one entry per package never enters the model's context.
+    resp = _http_client().post("/sbom", content=UV_LOCK_TEXT.encode("utf-8"))
+    assert resp.status_code == 200
+    bom = resp.json()
+    assert bom["bomFormat"] == "CycloneDX"
+    assert [c["name"] for c in bom["components"]] == ["django"]
+    # ...pretty-printed, because it lands on disk as a file a human opens: minified
+    # JSON is one line tens of KB wide, which only scrolls sideways in an editor.
+    assert '\n  "bomFormat"' in resp.text
+
+
+def test_sbom_endpoint_covers_every_component_with_no_scan_cap():
+    # An SBOM is a bill of materials: scan_repo's max_components cap trims what gets
+    # matched against NVD, but it must never trim what the SBOM claims is installed.
+    lock = "\n".join(f"pkg{i}==1.0" for i in range(60))
+    bom = _http_client().post("/sbom", content=lock.encode("utf-8")).json()
+    assert len(bom["components"]) == 60
+
+
+def test_sbom_endpoint_400s_rather_than_writing_an_empty_sbom():
+    # curl writes this response straight to reports/<date>-sbom.cdx.json. A 200 with
+    # zero components would leave a valid-looking file on disk asserting the repo
+    # depends on nothing - a false statement, and the failure would be invisible.
+    empty_npm = json.dumps({"lockfileVersion": 3, "packages": {}})
+    resp = _http_client().post("/sbom", content=empty_npm.encode("utf-8"))
+    assert resp.status_code == 400
+    assert "EMPTY npm lockfile" in resp.text
+    assert _http_client().post("/sbom", content=b"").status_code == 400
+
+
+def test_scan_command_saves_the_sbom_alongside_the_report():
+    # The SBOM is retrieved on every scan, not on request: it costs the model nothing
+    # (it never passes through context) and the artifact is there when anyone wants it.
+    text = mcp_server.get_scan_command(_fake_ctx({"host": "example.test"}))
+    assert text.count("/sbom --data-binary") == 2      # both shells
+    assert "-sbom.cdx.json" in text
+    assert text.index("/scan --data-binary") < text.index("/sbom --data-binary")
+    # ...and the caller is told where it landed without being told to open it.
+    assert "never open or print the file" in text
+
+
+def test_summary_block_names_the_sbom_file():
+    # The caller relays only this block, so the SBOM's path has to be inside it or the
+    # human never learns the file exists.
+    block = "\n".join(mcp_server._summary_block(ScanResult(), {"cache": FULL_CACHE}))
+    assert mcp_server.SBOM_FILENAME in block
+
+
 def test_scan_http_endpoint_rejects_empty_body_with_usage_hint():
     resp = _http_client().post("/scan", content=b"")
     assert resp.status_code == 400

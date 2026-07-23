@@ -75,10 +75,9 @@ user to switch to Act mode instead of re-describing the plan.
   command-line equivalent, so there is never a module path worth guessing.
   (`scan_repo.py` files in this repo are deliberate error-stubs, not real
   entry points.)
-- **Never write to or edit any existing file** - not the lockfile, not the
-  source, not this rules file. The command writes the report and refreshes
-  `.clinerules/scan-repo.md` itself; the only file you ever write by hand is
-  an SBOM, and only if explicitly asked. Never retype this rules file: a
+- **Never write to or edit any file** - not the lockfile, not the source,
+  not this rules file, not the SBOM. The command writes the report, the
+  SBOM and this rules file itself; you write nothing. Never retype this rules file: a
   model asked to reproduce it verbatim truncated it and silently lost the
   reporting rules below. `curl` copies it exactly and costs nothing.
 - **If a command or tool call fails, read the error** - it says exactly
@@ -127,12 +126,15 @@ user to switch to Act mode instead of re-describing the plan.
 
 ## SBOMs
 
-Only if the user explicitly asks for an SBOM: append `?include_sbom=true`
-to the scan URL from step 2, and save the SBOM section they asked for
-(e.g. as `sbom.cdx.json`). Never pass a pre-existing SBOM file from the
-repo into the scanner - there is no input for it, by design (a pre-made
-SBOM is unverifiable; the lockfile is the only ground truth). The scanner
-always generates its own fresh SBOM from the lockfile.
+The command in step 2 already saves one. Its last `curl` writes the
+CycloneDX SBOM the scanner generated from the same lockfile to
+`reports/<YYYY-MM-DD>-sbom.cdx.json`, alongside the report, on every scan -
+so when the user asks for an SBOM, tell them the path. **Never open, print
+or retype that file**: it holds one entry per package and is as capable of
+overflowing your context as the lockfile it came from. Never write one by
+hand either, and never pass a pre-existing SBOM from the repo into the
+scanner - there is no input for it, by design (a pre-made SBOM is
+unverifiable; the lockfile is the only ground truth).
 
 ## Other MCP tools on this server (you rarely need them)
 
