@@ -1,11 +1,15 @@
 import datetime
 import json
+import os
 import sqlite3
 from pathlib import Path
 
 from it_security_agent import nvd_client
 
-DB_PATH = Path(__file__).resolve().parent.parent / "nvd_cache.db"
+DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "nvd_cache.db"
+# Kept as a module constant for backward compatibility; the NVD_CACHE_DB override is
+# applied in get_connection (read at call time, so a .env loaded at startup still wins).
+DB_PATH = DEFAULT_DB_PATH
 
 # Bump when _products_in() changes what it extracts, to force a rebuild of cve_products.
 PRODUCT_INDEX_VERSION = 1
@@ -14,15 +18,38 @@ PRODUCT_INDEX_VERSION = 1
 # locked" on SQLite's 5s default.
 BUSY_TIMEOUT_SECONDS = 180
 
+_VALID_JOURNAL_MODES = {"WAL", "DELETE", "TRUNCATE", "PERSIST", "MEMORY", "OFF"}
+
+
+def _journal_mode() -> str:
+    """SQLite journal mode to use, read at call time (not import) so a .env loaded after
+    this module is imported still applies - mcp_server imports nvd_cache before it calls
+    load_dotenv().
+
+    WAL is the right default on local disk: readers stay unblocked while the sync thread
+    writes. But WAL needs an mmap'd shared-memory (-shm) file that network filesystems
+    (NFS) cannot provide - there SQLite fails to open the DB at all, even read-only, with
+    "attempt to write a readonly database". Set NVD_CACHE_JOURNAL_MODE=DELETE when the
+    cache lives on NFS to use rollback-journal locking, which NFSv4 does support. An
+    existing WAL DB must also be converted once (PRAGMA locking_mode=EXCLUSIVE; PRAGMA
+    journal_mode=DELETE) - the header journal mode is persisted, and this code will not
+    fight it back to WAL.
+    """
+    mode = os.environ.get("NVD_CACHE_JOURNAL_MODE", "WAL").strip().upper()
+    return mode if mode in _VALID_JOURNAL_MODES else "WAL"
+
 
 def get_connection(db_path=None):
-    conn = sqlite3.connect(db_path or DB_PATH, timeout=BUSY_TIMEOUT_SECONDS)
-    # WAL keeps readers unblocked while the sync thread writes. Setting the mode needs a
-    # brief exclusive lock the busy timeout does NOT cover, so check first and let a
-    # contended attempt pass - it's a performance setting, and the next open converts it.
+    conn = sqlite3.connect(db_path or os.environ.get("NVD_CACHE_DB") or DB_PATH,
+                           timeout=BUSY_TIMEOUT_SECONDS)
+    # Journal mode keeps readers unblocked while the sync thread writes (WAL on local disk;
+    # DELETE on NFS - see _journal_mode). Setting the mode needs a brief exclusive lock the
+    # busy timeout does NOT cover, so check first and let a contended attempt pass - it's a
+    # performance setting, and the next open converts it.
+    mode = _journal_mode()
     try:
-        if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
-            conn.execute("PRAGMA journal_mode=WAL")
+        if conn.execute("PRAGMA journal_mode").fetchone()[0].upper() != mode:
+            conn.execute(f"PRAGMA journal_mode={mode}")
     except sqlite3.OperationalError:
         pass
     conn.execute("PRAGMA synchronous=NORMAL")  # durable enough for a rebuildable cache
